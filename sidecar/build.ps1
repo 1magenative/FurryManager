@@ -31,10 +31,18 @@ if (-not (Test-Path "$built\fm-sidecar.exe")) {
 }
 
 # Flatten into sidecar\dist (this is where the app and the installer look)
+$placeholder = "sidecar\dist\PLACEHOLDER.txt"
+$keep = if (Test-Path $placeholder) { Get-Content $placeholder -Raw -Encoding UTF8 } else { $null }
 if (Test-Path "sidecar\dist") { Remove-Item "sidecar\dist" -Recurse -Force }
 New-Item -ItemType Directory -Path "sidecar\dist" | Out-Null
 Copy-Item "$built\*" "sidecar\dist\" -Recurse -Force
 Remove-Item "sidecar\dist_build" -Recurse -Force
+
+# PLACEHOLDER.txt is the only tracked file in sidecar\dist: it keeps the folder
+# present in a fresh clone, otherwise the Tauri build script fails with
+# "resource path `..\sidecar\dist` doesn't exist". Do not let a rebuild eat it.
+if (-not $keep) { $keep = "Built sidecar goes here. See sidecar/BUILD.md." }
+Set-Content $placeholder $keep -Encoding UTF8 -NoNewline
 
 $size = [math]::Round((Get-ChildItem "sidecar\dist" -Recurse |
     Measure-Object -Property Length -Sum).Sum / 1MB, 1)

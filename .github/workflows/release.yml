@@ -37,6 +37,16 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked
 
+      # Сайдкар здесь не собирается, но папка-ресурс должна существовать,
+      # иначе build.rs падает: resource path `..\sidecar\dist` doesn't exist.
+      - name: Ensure sidecar resource dir
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path sidecar/dist | Out-Null
+          if (-not (Get-ChildItem sidecar/dist -Force)) {
+            Set-Content sidecar/dist/PLACEHOLDER.txt "No packaged sidecar in CI builds; AI features go through Python."
+          }
+
       - name: Build installer
         run: cargo tauri build
 

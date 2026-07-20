@@ -33,14 +33,28 @@ powershell -ExecutionPolicy Bypass -File sidecar\build.ps1
 
 ## Включить в установщик
 
-В `src-tauri/tauri.conf.json` в секции `bundle` добавь папку сборки в ресурсы:
+Уже включено: в `src-tauri/tauri.conf.json` папка сборки перечислена в ресурсах.
 
 ```json
-"resources": { "../sidecar/dist/fm-sidecar": "sidecar/" }
+"resources": {
+  "../sidecar/dist": "sidecar",
+  "../sidecar/main.py": "sidecar/main.py",
+  "../sidecar/requirements.txt": "sidecar/requirements.txt"
+}
 ```
 
-Тогда `cargo tauri build` положит сайдкар рядом с приложением, и установщик
-станет самодостаточным.
+Собран сайдкар — `cargo tauri build` кладёт его рядом с приложением, и
+установщик становится самодостаточным. Не собран — ставится только `main.py`,
+и ИИ пойдёт через Python.
+
+### `sidecar/dist/PLACEHOLDER.txt` — не удалять
+
+Сама сборка в git не хранится (сотни мегабайт, см. `.gitignore`), но **папка
+должна существовать**: Tauri проверяет пути ресурсов в build-скрипте и падает
+с `resource path ..\sidecar\dist doesn't exist` ещё до компиляции. Поэтому
+`PLACEHOLDER.txt` — единственный отслеживаемый файл внутри `dist`, он держит
+папку в репозитории. `build.ps1` пересоздаёт его после сборки; CI-workflow
+подстраховывается отдельным шагом.
 
 ## Важные нюансы
 
