@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FurryManager</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body data-mode="basic">
+
+  <!-- Шапка -->
+  <header id="topbar">
+    <div class="logo" title="FurryManager">🦊 <span>FurryManager</span></div>
+    <div class="searchwrap">
+      <span id="sim-chip" class="hidden" title="Фильтр: похожие на арт. Клик по картинке — открыть арт, ✕ — снять"></span>
+      <input id="search" type="text" placeholder="Поиск: лис, куртка… (Enter)" autocomplete="off" />
+      <button id="smart-toggle" class="ghost" title="Умный поиск: опиши словами, например «рыжий лис в куртке». Работает после индексации (кнопка 🧠 справа).">🧠</button>
+      <button id="search-clear" class="ghost" title="Очистить">✕</button>
+    </div>
+    <div class="menu-wrap">
+      <button id="btn-import" class="primary" title="Добавить арты (или просто перетащи файлы в окно)">＋ Импорт ▾</button>
+      <div id="import-menu" class="menu hidden">
+        <div class="menu-item" id="mi-folder">📂 Папку целиком…</div>
+        <div class="menu-item" id="mi-files">🖼 Отдельные файлы…</div>
+        <div class="menu-item" id="mi-paste" title="Вставить картинку из буфера обмена (Win+V — история буфера). Арт попадёт в открытую коллекцию и вкладку SFW/NSFW.">📋 Вставить из буфера</div>
+        <div class="menu-sep"></div>
+        <div class="menu-item" id="mi-folder-inplace" title="Файлы остаются на своих местах, в библиотеку попадают только ссылки, теги и превью. Ничего не копируется.">📎 Папку без копирования…</div>
+      </div>
+    </div>
+    <div class="menu-wrap">
+      <button id="btn-ai" class="ghost" title="ИИ: индексация для умного поиска и автотегов">🧠</button>
+      <div id="ai-menu" class="menu hidden">
+        <div class="menu-title" id="ai-status">…</div>
+        <div class="menu-item" id="ai-run">🔄 Проиндексировать библиотеку</div>
+        <div class="menu-item" id="ai-reindex">♻ Полная переиндексация…</div>
+        <div class="menu-item" id="ai-setup">⬇ Установить ИИ-компоненты</div>
+        <div class="menu-item" id="ai-help">ℹ️ Что это?</div>
+      </div>
+    </div>
+    <button id="btn-health" class="ghost" title="Статистика и здоровье библиотеки">📊</button>
+    <button id="btn-lock" class="ghost" title="Заблокировать шторкой прямо сейчас (Ctrl+L)">🔒</button>
+    <button id="btn-dupes" class="ghost adv" title="Найти дубликаты и почти-копии">🧹</button>
+    <button id="btn-help" class="ghost" title="Справка">?</button>
+    <button id="btn-settings" class="ghost" title="Настройки">⚙️</button>
+  </header>
+
+  <!-- Панель статистики -->
+  <div id="statsbar"></div>
+
+  <!-- Коллекции -->
+  <div id="collections-bar"></div>
+
+  <!-- Галерея -->
+  <main id="gallery-wrap">
+    <div id="empty-state" class="hidden">
+      <div class="big">🎨</div>
+      <h2>Библиотека пока пуста</h2>
+      <p>Нажми «Импорт папки» или просто <b>перетащи файлы/папки в это окно</b> —<br/>я скопирую их в библиотеку, уберу дубликаты и сделаю превью.</p>
+      <button class="primary" id="empty-import">＋ Импортировать первую папку</button>
+    </div>
+    <div id="gallery"></div>
+    <div id="scroll-sentinel"></div>
+  </main>
+
+  <!-- Оверлей при перетаскивании файлов -->
+  <div id="drop-overlay" class="hidden">
+    <div class="drop-inner">📥 Отпусти, чтобы добавить в библиотеку</div>
+  </div>
+
+  <!-- Контекстное меню (ПКМ) -->
+  <div id="ctx-menu" class="menu hidden"></div>
+  <div id="ctx-sub" class="menu hidden"></div>
+
+  <!-- Панель мультивыбора -->
+  <div id="select-bar" class="hidden">
+    <span id="sel-count">Выбрано: 0</span>
+    <button id="sel-tag" class="secondary small-btn" title="Добавить тег всем выбранным">🏷 Тег</button>
+    <button id="sel-col" class="secondary small-btn" title="Добавить выбранные в коллекцию">📚 В коллекцию</button>
+    <button id="sel-uncol" class="secondary small-btn hidden" title="Убрать выбранные из открытой коллекции (арты останутся в библиотеке)">📚✕ Из коллекции</button>
+    <button id="sel-auto" class="secondary small-btn" title="Автоматически распределить выбранные по подходящим коллекциям (по тегам)">🪄 Авто</button>
+    <button id="sel-group" class="secondary small-btn" title="Объединить выбранные в НОВУЮ группу: комикс (страницы по порядку) или вариации одного арта">🧩 Сгруппировать</button>
+    <button id="sel-grp-add" class="secondary small-btn" title="Добавить выбранные в существующую группу">🧩→ В группу</button>
+    <button id="sel-merge" class="secondary small-btn hidden" title="Объединить выделенные группы в одну (страницы — в порядке выделения)">🧩⊕ Объединить</button>
+    <button id="sel-sfw" class="secondary small-btn nsfw-only" title="Пометить выбранные как SFW">🌱</button>
+    <button id="sel-nsfw" class="secondary small-btn nsfw-only" title="Пометить выбранные как NSFW">🔞</button>
+    <button id="sel-auto-nsfw" class="secondary small-btn nsfw-only" title="Вернуть выбранным автоопределение SFW/NSFW (по рейтингу от ИИ)">♻</button>
+    <button id="sel-del" class="secondary small-btn" title="Удалить выбранные из библиотеки">🗑 Удалить</button>
+    <button id="sel-clear" class="ghost small-btn" title="Снять выделение (Esc)">✕</button>
+  </div>
+  <div id="sel-panel" class="hidden"></div>
+
+  <!-- Прогресс импорта -->
+  <div id="import-toast" class="hidden">
+    <div class="toast-title">Импортирую…</div>
+    <div class="progress"><div id="import-bar"></div></div>
+    <div id="import-info" class="toast-info"></div>
+    <button id="import-cancel" class="ghost small-btn hidden">✕ Отменить</button>
+  </div>
+
+  <!-- Просмотрщик -->
+  <div id="viewer" class="hidden">
+    <button id="viewer-close" class="ghost close" title="Закрыть (Esc)">✕</button>
+    <button id="nav-prev" class="navbtn" title="Предыдущий (←)">‹</button>
+    <button id="nav-next" class="navbtn" title="Следующий (→)">›</button>
+    <div id="viewer-media"></div>
+    <aside id="viewer-side">
+      <h3 id="v-title">Файл</h3>
+      <div id="v-info" class="muted small"></div>
+
+      <div class="side-section">
+        <div class="side-label">Теги</div>
+        <div id="v-tags" class="chips"></div>
+        <div class="tag-add">
+          <input id="tag-input" type="text" placeholder="Добавить тег…" autocomplete="off" />
+          <button id="tag-add-btn" class="primary small-btn">＋</button>
+          <div id="tag-suggest" class="menu hidden"></div>
+        </div>
+        <div class="hint adv">Подсказка: <code>раса:лис</code> добавит тег в неймспейс «раса»</div>
+      </div>
+
+      <div class="side-section">
+        <div class="side-label">Коллекции</div>
+        <div id="v-collections" class="chips"></div>
+        <div class="hint">Клик — добавить/убрать из коллекции. Создать новую можно на главной, в панели под поиском.</div>
+      </div>
+
+      <div class="side-section" id="v-group-section" style="display:none;">
+        <div class="side-label">Группа</div>
+        <div id="v-group-info" class="muted small" style="margin-bottom:6px;"></div>
+        <div class="btn-row">
+          <button id="btn-group-edit" class="secondary">🧩 Редактировать группу</button>
+        </div>
+      </div>
+
+      <div class="side-section">
+        <div class="side-label">Похожие</div>
+        <div class="btn-row">
+          <button id="btn-sim-local" class="secondary" title="Похожие по стилю и содержанию в твоей библиотеке (после индексации)">📁 В библиотеке</button>
+          <button id="btn-sim-web" class="secondary" title="Найти этот же арт на других сайтах — источник и автора (через Fluffle.xyz)">🔎 Найти источник</button>
+          <button id="btn-sim-tags" class="secondary" title="Открыть на e621/FurAffinity поиск по тегам этого арта — ещё арты на эту тему">🏷 Похожее по тегам</button>
+        </div>
+        <div id="sim-status" class="muted small"></div>
+        <div id="sim-results"></div>
+      </div>
+
+      <div class="side-section">
+        <button id="btn-delete" class="danger" title="Удаляет копию из библиотеки. Исходный файл на диске (если он ещё есть) не трогается.">🗑 Удалить из библиотеки</button>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Онбординг -->
+  <div id="onboarding" class="hidden">
+    <div class="modal">
+      <div class="ob-step" data-step="1">
+        <div class="big">🦊</div>
+        <h2>Привет! Я FurryManager</h2>
+        <p>Помогу навести порядок в коллекции артов: теги и коллекции вместо папок, поиск, дубликаты, превью.</p>
+        <div class="privacy-box">🔒 <b>Всё локально.</b> Твои арты и теги хранятся и обрабатываются только на этом компьютере и никуда не отправляются. Интернет — лишь по твоей команде (скачать по ссылке из расширения, найти источник). Никакого облака, аккаунтов и аналитики.</div>
+        <button class="primary ob-next">Начать →</button>
+      </div>
+      <div class="ob-step hidden" data-step="2">
+        <h2>Где хранить библиотеку?</h2>
+        <p>Выбери (или создай) папку — туда я сложу файлы, превью и базу тегов.</p>
+        <p><b>Важно понимать:</b> при импорте я <b>копирую</b> файлы в библиотеку. Оригиналы остаются где были — их можно потом удалять, копия в библиотеке сохранится.</p>
+        <button class="secondary" id="ob-choose">📂 Выбрать папку…</button>
+        <div id="ob-chosen" class="muted small"></div>
+        <button class="primary ob-next" id="ob-next-2" disabled>Дальше →</button>
+      </div>
+      <div class="ob-step hidden" data-step="3">
+        <h2>Как тебе удобнее?</h2>
+        <label class="radio-card">
+          <input type="radio" name="ob-mode" value="basic" checked />
+          <div><b>Базовый</b><br/><span class="muted">Просто галерея, поиск и теги. Рекомендую для начала — переключить можно в любой момент.</span></div>
+        </label>
+        <label class="radio-card">
+          <input type="radio" name="ob-mode" value="advanced" />
+          <div><b>Продвинутый</b><br/><span class="muted">Неймспейсы тегов (<code>раса:лис</code>), синтаксис поиска (<code>-эскиз</code>), тех. детали файлов.</span></div>
+        </label>
+        <button class="primary" id="ob-finish">Поехали! 🚀</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Настройки -->
+  <div id="settings" class="hidden">
+    <div class="modal set-modal">
+      <button class="ghost close" id="settings-close">✕</button>
+      <h2>Настройки</h2>
+      <div class="set-layout">
+      <nav class="set-nav">
+        <button class="set-tab-btn active" data-tab="general">⚙ Общие</button>
+        <button class="set-tab-btn" data-tab="storage">💾 Хранение</button>
+        <button class="set-tab-btn" data-tab="org">📚 Организация</button>
+        <button class="set-tab-btn" data-tab="conn">📱 Подключения</button>
+        <button class="set-tab-btn" data-tab="privacy">🔒 Приватность</button>
+        <button class="set-tab-btn" data-tab="helptab">📖 Справка</button>
+      </nav>
+      <div class="set-panels">
+
+      <section class="set-tab active" data-tab="general">
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">Режим интерфейса</div>
+      <label class="radio-card">
+        <input type="radio" name="set-mode" value="basic" />
+        <div><b>Базовый</b><br/><span class="muted">Галерея, поиск, простые теги.</span></div>
+      </label>
+      <label class="radio-card">
+        <input type="radio" name="set-mode" value="advanced" />
+        <div><b>Продвинутый</b><br/><span class="muted">Неймспейсы тегов (<code>раса:лис</code>), синтаксис поиска (<code>-эскиз</code>), тех. детали.</span></div>
+      </label>
+
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Контент</div>
+      <label class="radio-card">
+        <input type="checkbox" id="set-nsfw-split" />
+        <div><b>Разделять SFW и NSFW</b><br/>
+        <span class="muted">Появятся вкладки 🌱 SFW и 🔞 NSFW. Арты распределяются автоматически по рейтингу от ИИ (explicit/questionable → NSFW). Ошибся ИИ — правый клик по арту → «Пометить SFW/NSFW». Файлы физически не перемещаются, это фильтр поверх одной библиотеки.</span></div>
+      </label>
+      <div id="set-default-filter-wrap" class="set-subopt hidden">
+        <label>Фильтр при запуске:
+          <select id="set-default-filter">
+            <option value="">📚 Все</option>
+            <option value="0">🌱 SFW</option>
+            <option value="1">🔞 NSFW</option>
+          </select>
+        </label>
+        <span class="muted small">Какая вкладка активна при каждом открытии приложения.</span>
+      </div>
+      </section>
+
+      <section class="set-tab" data-tab="storage">
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">ИИ-модуль</div>
+      <div class="muted small" style="text-align:left; margin-bottom:8px;" id="sidecar-status">…</div>
+      <div class="btn-row" style="margin-bottom:14px;">
+        <button class="secondary" id="btn-ai-install">⬇ Установить ИИ-компоненты</button>
+      </div>
+
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">Папка библиотеки</div>
+      <div class="muted small" style="text-align:left; word-break:break-all;" id="lib-path">—</div>
+      <div class="btn-row" style="margin:8px 0 14px;">
+        <button class="secondary" id="btn-lib-change">📂 Сменить папку библиотеки…</button>
+        <button class="secondary" id="btn-lib-open" title="Открыть папку в проводнике">📂 Показать</button>
+      </div>
+
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">Хранение</div>
+      <label class="radio-card">
+        <input type="checkbox" id="set-lossless" />
+        <div><b>Сжимать PNG без потерь (→ WebP)</b><br/>
+        <span class="muted">При копировании в библиотеку PNG пережимаются в WebP без потери качества — обычно −30–50% места. Оригинал на диске не меняется; касается только копий внутри библиотеки (не режима «без копирования»). Уже добавленные файлы не трогаются.</span></div>
+      </label>
+      <div class="btn-row" style="margin-top:8px;">
+        <button class="secondary" id="btn-repair" title="Ищет арты без превью, распознаёт HEIC-фото, сохранённые с неверным расширением (проделка iOS), конвертирует их в JPEG и восстанавливает превью">🔧 Починить битые импорты</button>
+      </div>
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Резервная копия / перенос</div>
+      <div class="muted small" style="text-align:left; margin-bottom:8px;">Экспорт собирает всю библиотеку в один zip: арты, превью, база (теги, коллекции, группы) и настройки. Импорт разворачивает такой архив в текущую библиотеку — <b>база заменяется базой из архива</b>. Арты «без копирования» (in-place) в архив не попадают.</div>
+      <div class="btn-row">
+        <button class="secondary" id="btn-export">📦 Экспортировать библиотеку…</button>
+        <button class="secondary" id="btn-import-lib">📥 Импортировать из архива…</button>
+      </div>
+      </section>
+
+      <section class="set-tab" data-tab="org">
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">Коллекции</div>
+      <div id="set-collections"></div>
+      <div class="muted small" style="text-align:left; margin-top:4px;">Порядок — стрелками ↑/↓, ✎ — переименовать, 🗑 — удалить (арты останутся в библиотеке). Создать новую коллекцию можно на главном экране, в панели под поиском.</div>
+
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Теги</div>
+      <div class="btn-row">
+        <button class="secondary" id="btn-tagmgr">🏷 Менеджер тегов (переименовать / слить / удалить)</button>
+      </div>
+
+      <div class="adv">
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Связи тегов (синонимы и импликации)</div>
+      <div class="muted small" style="text-align:left; margin-bottom:8px;">Помогают поиску: <b>синоним</b> «лис = fox» — находит одно по другому; <b>импликация</b> «folf → fox» — арты с узким тегом находятся по общему. Можно указывать неймспейс: <code>раса:лис</code>.</div>
+      <div class="rel-add">
+        <input id="rel-from" type="text" placeholder="тег (лис)" autocomplete="off" />
+        <select id="rel-kind">
+          <option value="alias">= синоним</option>
+          <option value="implies">→ подразумевает</option>
+        </select>
+        <input id="rel-to" type="text" placeholder="тег (fox)" autocomplete="off" />
+        <button class="secondary small-btn" id="rel-add" title="Добавить связь">＋</button>
+      </div>
+      <div id="rel-list"></div>
+
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Автодобавление из папок (watcher)</div>
+      <div class="muted small" style="text-align:left; margin-bottom:8px;">Слежу за выбранными папками: новые файлы там сами попадают в библиотеку (а добавленные при выключенном приложении — подхватываю при следующем запуске).</div>
+      <label class="watch-mode"><input type="checkbox" id="watch-inplace" /> оставлять файлы на месте (без копирования)</label>
+      <div class="btn-row" style="margin:8px 0;"><button class="secondary small-btn" id="watch-add">＋ Добавить папку…</button></div>
+      <div id="watch-list"></div>
+      </div>
+      </section>
+
+      <section class="set-tab" data-tab="conn">
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">Расширение браузера</div>
+      <p style="text-align:left; font-size:12px;">Сохраняет арты с e621, FurAffinity и др. одним кликом. Установка: Chrome → Расширения → «Режим разработчика» → «Загрузить распакованное» → выбери папку <code>extension</code> из папки проекта. Затем вставь этот токен в настройки расширения:</p>
+      <div style="display:flex; gap:6px;">
+        <input id="ext-token" type="text" readonly style="flex:1; background:var(--bg3); border:1px solid #34343f; border-radius:8px; color:var(--text); padding:7px 10px;" />
+        <button class="secondary small-btn" id="ext-token-copy" title="Скопировать токен">📋</button>
+      </div>
+      <div class="muted small" style="text-align:left; margin-top:4px;" id="ext-port"></div>
+
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Куки браузера (возрастной контент)</div>
+      <div class="set-subopt" style="margin-left:0; border-left:none; padding-left:0;">
+        <label>Брать куки из:
+          <select id="set-cookies">
+            <option value="">не использовать</option>
+            <option value="chrome">Chrome</option>
+            <option value="edge">Edge</option>
+            <option value="firefox">Firefox</option>
+            <option value="brave">Brave</option>
+            <option value="opera">Opera</option>
+            <option value="vivaldi">Vivaldi</option>
+          </select>
+        </label>
+      </div>
+      <div class="muted small" style="text-align:left; margin-top:4px;">FurAffinity и e621 отдают взрослый контент только залогиненным. Скачивание возьмёт куки твоей сессии из выбранного браузера — качается ровно то, что видишь сам. Куки читаются локально и никуда не отправляются; браузер при этом лучше закрыть (он держит файл куки заблокированным).</div>
+
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Доступ с телефона</div>
+      <label class="radio-card">
+        <input type="checkbox" id="set-lan" />
+        <div><b>Разрешить отправку артов с телефона</b><br/>
+        <span class="muted">Приложение начнёт принимать арты по домашней (локальной) сети — например, через «Поделиться» на iPhone. Работает только когда этот компьютер включён и приложение запущено. Доступ защищён токеном; в интернет ничего не выставляется. Вне дома — через Tailscale/VPN до этого ПК.</span></div>
+      </label>
+      <div id="lan-setup" class="lan-setup hidden">
+        <div id="lan-qr"></div>
+        <div class="lan-info">
+          <div id="lan-url" class="muted small"></div>
+          <div class="muted small">Отсканируй QR камерой телефона — откроется мобильная страница библиотеки (галерея, поиск, загрузка артов). Там же «Поделиться → На экран Домой» превратит её в приложение. После включения или выключения галочки <b>перезапусти приложение</b>.</div>
+        </div>
+      </div>
+      </section>
+
+      <section class="set-tab" data-tab="privacy">
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">Приватность</div>
+      <div class="pin-box">
+        <b>ПИН-код при запуске</b>
+        <div class="muted small" id="pin-status" style="margin:4px 0 8px;"></div>
+        <div class="pin-row">
+          <input id="pin-old" type="password" inputmode="numeric" placeholder="текущий ПИН" autocomplete="off" class="hidden"/>
+          <input id="pin-new" type="password" inputmode="numeric" placeholder="новый ПИН (4+ цифр)" autocomplete="off"/>
+          <button class="secondary small-btn" id="pin-save">Сохранить</button>
+          <button class="secondary small-btn hidden" id="pin-off">Выключить</button>
+        </div>
+        <div style="margin-top:12px;">
+          <label>Скрывать библиотеку:
+            <select id="set-lockmode">
+              <option value="off">никогда</option>
+              <option value="hidden">при сворачивании и Win+L</option>
+              <option value="blur">при любой потере фокуса</option>
+            </select>
+          </label>
+          <div class="muted small" style="margin-top:4px;">«При сворачивании и Win+L» не срабатывает от простого переключения на другое окно. Возврат — по ПИН (если включён) или кнопкой. Применяется по кнопке «Сохранить».</div>
+        </div>
+      </div>
+      <div class="privacy-box">🔒 <b>Всё локально.</b> FurryManager хранит и обрабатывает арты и теги только на этом компьютере. Ничего не отправляется в интернет, нет аккаунтов, облака и аналитики. Приложение выходит в сеть <b>лишь по твоей команде</b>: скачать арт по ссылке из браузерного расширения, а по кнопке «🌐 В интернете» — найти источник/похожее. ИИ-индексация и умный поиск работают офлайн (модели скачиваются один раз при установке).</div>
+      </section>
+
+      <section class="set-tab" data-tab="helptab">
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">Справка</div>
+      <div class="btn-row set-help-row">
+        <button class="secondary" id="set-open-help">📖 Как пользоваться</button>
+        <button class="secondary" id="set-open-guide">👋 Показать вводный гайд</button>
+      </div>
+      <div class="muted small" style="margin-top:14px;" id="app-version">FurryManager</div>
+      </section>
+
+      </div><!-- /set-panels -->
+      </div><!-- /set-layout -->
+
+      <div class="settings-footer">
+        <button class="primary" id="settings-save">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Справка -->
+  <div id="help" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="help-close">✕</button>
+      <h2>Как пользоваться</h2>
+      <div class="privacy-box">🔒 <b>Приватность.</b> Всё работает локально на твоём ПК. Арты и теги никуда не отправляются — ни в облако, ни на серверы, никакой аналитики и аккаунтов. Интернет используется только по твоей команде: скачивание по ссылке из расширения и поиск источника/похожего (кнопки «🔎 Найти источник» и «🏷 Похожее по тегам»). ИИ-модели работают офлайн (скачиваются один раз).</div>
+      <p><b>Как это устроено.</b> Библиотека — отдельная папка, куда я <b>копирую</b> каждый импортированный файл. Поэтому: удалил оригинал с рабочего стола — копия в библиотеке осталась; удалил арт в менеджере («🗑 Удалить») — исчезла только копия из библиотеки, оригинал (если он ещё есть) не трогается. Точные дубликаты определяются по содержимому и не занимают место повторно.</p>
+      <p><b>Импорт.</b> Кнопка «Импорт» (папка целиком или отдельные файлы) — или просто перетащи файлы/папки прямо в окно. По умолчанию файлы <b>копируются</b> в библиотеку. Фото iPhone в формате <b>HEIC</b> при импорте автоматически конвертируются в JPEG (нужен Python с пакетом pillow-heif — ставится через 🧠 → «Установить ИИ-компоненты»; оригиналы не меняются). Вариант «📎 Папку без копирования» (in-place) оставляет оригиналы на месте — в библиотеку попадают только ссылка, теги и превью; это экономит место, но если ты потом переместишь или удалишь исходный файл, арт в галерее перестанет открываться. Удаление in-place-арта из библиотеки убирает только запись — сам файл на диске остаётся.</p>
+      <p><b>Автодобавление из папок.</b> В ⚙ Настройках → «Автодобавление из папок» можно указать папки, за которыми я слежу: новые файлы там сами попадают в библиотеку (можно выбрать режим «без копирования»). Файлы, добавленные при выключенном приложении, подхватываются при следующем запуске. Удалённые из библиотеки арты «запоминаются» и обратно из отслеживаемых папок не возвращаются; вернуть такой арт можно обычным ручным импортом.</p>
+      <p><b>Выделение и ПКМ.</b> <code>Ctrl+клик</code> — выбрать несколько артов (<code>Shift+клик</code> — диапазон), <code>Ctrl+Shift+A</code> — выделить все загруженные арты текущего вида (например, всю вкладку SFW; долистай вниз, чтобы охватить всё). Внизу появится панель действий: тег всем, в коллекцию, 🪄 авто-распределение, SFW/NSFW/♻ авто, удалить. Правый клик по арту — быстрое меню.</p>
+      <p><b>Поиск.</b> Просто пиши слова: <code>лис куртка</code> — найду по тегам, автору и названию. Тип файла: добавь слово <code>gif</code>, <code>видео</code> или <code>фото</code> (или <code>type:gif</code>) — например <code>gif furry male</code>. Группы: <code>группы</code> или <code>type:group</code> — только стопки; <code>type:comic</code> — комиксы, <code>type:variants</code> — вариации. Здоровье: <code>untagged</code> — без тегов, <code>uncollected</code> — без коллекций. Чип «🕘 Недавние» показывает историю просмотров (свежие сверху), а кнопка 📊 вверху — статистику библиотеки. В умном поиске (🧠) кнопка «только точные» скрывает слабые совпадения.</p>
+      <p><b>Рассмотреть арт.</b> В просмотрщике: колесо мыши — зум, перетаскивание — панорама, двойной клик — сброс. ПКМ по арту — зум и <b>🎨 пипетка</b>: клик по любой точке покажет цвет (HEX сразу копируется в буфер).</p>
+      <div class="adv">
+        <p><b>Синтаксис (про-режим):</b> <code>раса:лис</code> — тег в неймспейсе; <code>-эскиз</code> — исключить тег; всё комбинируется: <code>раса:лис -эскиз куртка</code>.</p>
+      </div>
+      <p><b>Теги и коллекции.</b> Открой арт → справа теги и коллекции. Коллекция — как альбом или плейлист: один арт может быть в нескольких сразу, места это не занимает. Клик по тегу — поиск по нему. В панели под поиском: слева от разделителя — фильтры (Все, SFW/NSFW), справа — твои коллекции (клик — фильтровать галерею), «＋ Новая» — создать. Порядок коллекций, переименование и удаление — в ⚙ Настройках. Фильтр «📥 Без коллекции» показывает нераспределённые арты. Ещё можно вставить арт из буфера обмена: ПКМ по пустому месту галереи — «Вставить из буфера» (арт попадёт в открытую коллекцию и вкладку SFW/NSFW).</p>
+      <p><b>Группы: комиксы и вариации.</b> Выдели связанные арты (Ctrl+клик — порядок выделения станет порядком страниц) → «🧩 Сгруппировать» в панели снизу. В галерее группа выглядит одной «стопкой» с бейджем 🧩 N; открытие листает её страницы (стрелки), сбоку — кнопка редактора: имя, тип (комикс/вариации), порядок ↑/↓, исключение лишнего, роспуск группы. ПКМ по стопке — быстрый вход в редактор.</p>
+      <p><b>Авто-распределение.</b> ПКМ по арту (или выдели несколько Ctrl-кликом) → «🪄 Авто-распределить»: я сравню теги артов с характерными тегами твоих коллекций и предложу, куда что положить. Ничего не применяется без твоего подтверждения — сначала показываю предложение с галочками. Опционально могу создавать новые коллекции по общему тегу (только если набирается от 3 артов). Работает по тегам, поэтому лучше сначала проиндексировать библиотеку (🧠).</p>
+      <p><b>Синонимы и импликации тегов.</b> В ⚙ Настройках → «Связи тегов» можно задать синоним (<code>лис = fox</code> — ищется одно по другому) или импликацию (<code>folf → fox</code> — арты с узким тегом находятся по общему). Разворот применяется к обычному текстовому поиску автоматически.</p>
+      <p><b>Из браузера.</b> Установи расширение из папки <code>extension</code> (инструкция в ⚙ Настройках) — и кнопка «🦊 Сохранить в FurryManager» появится в ПКМ на e621, FurAffinity и сотнях других сайтов. Качает арты, гифки и видео с тегами и автором.</p>
+      <p><b>С телефона.</b> В ⚙ Настройках включи «Доступ с телефона», перезапусти приложение и отсканируй QR камерой телефона — откроется <b>мобильная страница библиотеки</b>: галерея с поиском и фильтрами, просмотр, кнопка «＋» загружает арты из фотоплёнки прямо в менеджер, «🔗» добавляет по ссылке (ПК скачает через gallery-dl с тегами). «Поделиться → На экран Домой» — и это полноценное приложение. Всё работает по домашней сети с токеном, в интернет ничего не выставляется; ПК должен быть включён. Вне дома — Tailscale/VPN до этого ПК. Для продвинутых: те же <code>POST /ingest</code> и <code>/ingest-file</code> доступны из ярлыков «Команд».</p>
+      <p><b>Похожие.</b> «📁 В библиотеке» — дубликаты и почти-копии среди твоих файлов (после индексации — похожие по стилю и содержанию). «🔎 Найти источник» — обратный поиск по FurAffinity, e621, Weasyl, Twitter (через Fluffle.xyz): находит <b>этот же</b> арт на сайтах, автора и первоисточник. «🏷 Похожее по тегам» — открывает на e621/danbooru/FurAffinity поиск по тегам этого арта (можно выбрать какие): так находятся <b>другие</b> арты на ту же тему. Автотеги совпадают со словарём e621/danbooru, поэтому там результат точнее, чем на FA. Найденные «в библиотеке» похожие интерактивны: клик открывает арт, ПКМ — копировать/проводник/в группу/удалить; кнопка «Показать все» внизу открывает похожих прямо в галерее — у поиска появится чип с образцом (клик по нему возвращает к арту, ✕ снимает фильтр).</p>
+      <p><b>ИИ (🧠).</b> Кнопка 🧠 справа вверху → «Проиндексировать»: локальная нейросеть просмотрит арты, повесит автотеги (раса, одежда, рейтинг — помечены как авто) и включит <b>умный поиск</b>: жми 🧠 в строке поиска и описывай словами — «рыжий лис в куртке» (лучше по-английски: «red fox in jacket»). Всё работает локально, в интернет арты не отправляются. Первый запуск скачает модели (~1 ГБ). Видео и гифки индексируются по кадру-превью. «♻ Полная переиндексация» стирает автотеги и вектора и проходит библиотеку заново — с опциями авто-SFW/NSFW и раскладки по коллекциям после.</p>
+      <p class="muted small">Горячие клавиши: <code>Esc</code> — закрыть, <code>/</code> — в поиск, <code>Ctrl+L</code> — заблокировать шторкой, <code>Ctrl+Shift+A</code> — выделить всё, <code>←</code> <code>→</code> — листать в просмотрщике, <code>Delete</code> — удалить открытый арт.</p>
+    </div>
+  </div>
+
+  <!-- Дубликаты (near-dupe) -->
+  <div id="dupes" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="dupes-close">✕</button>
+      <h2>Дубликаты и почти-копии</h2>
+      <p>Похожие и пересейвы (разного размера/формата) сгруппированы. Точные копии не занимают места и здесь не показываются. Рекомендую оставлять самый крупный вариант (★).</p>
+      <div class="dupe-controls">
+        <label>Похожесть:
+          <select id="dupe-thr">
+            <option value="4">Строгая (почти идентичные)</option>
+            <option value="8" selected>Обычная</option>
+            <option value="12">Свободная (больше совпадений)</option>
+          </select>
+        </label>
+        <button class="secondary small-btn" id="dupe-rescan">🔄 Пересканировать</button>
+        <button class="secondary small-btn" id="dupe-autogroup" title="Найти разбросанные вариации (по похожести) и страницы комиксов (по общему названию источника) и предложить собрать их в группы">🧩 Предложить группы</button>
+        <span id="dupe-status" class="muted small"></span>
+      </div>
+      <div id="dupes-list"></div>
+      <div class="dupe-footer">
+        <button class="danger" id="dupe-del" disabled>🗑 Удалить отмеченные (0)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Менеджер тегов (массовое редактирование) -->
+  <div id="tagmgr" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="tm-close">✕</button>
+      <h2>🏷 Теги библиотеки</h2>
+      <p>Переименование, слияние и удаление действуют на <b>всю библиотеку</b>. Ручные теги и автотеги показаны раздельно.</p>
+      <div class="tm-controls">
+        <input id="tm-search" type="search" placeholder="Поиск тега…" autocomplete="off"/>
+        <span id="tm-status" class="muted small"></span>
+      </div>
+      <div id="tm-list"></div>
+      <div class="dupe-footer" style="justify-content:space-between;">
+        <span id="tm-sel" class="muted small"></span>
+        <span style="display:flex; gap:8px;">
+          <button class="secondary" id="tm-merge" disabled>Слить выбранные…</button>
+          <button class="danger" id="tm-delete" disabled>Удалить выбранные</button>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Статистика и здоровье библиотеки -->
+  <div id="health" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="health-close">✕</button>
+      <h2>📊 Статистика и здоровье</h2>
+      <div id="health-body">Считаю…</div>
+      <div class="dupe-footer">
+        <button class="secondary" id="health-clear-views">Очистить историю просмотров</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Шторка приватности: ПИН при запуске / блокировка при потере фокуса -->
+  <div id="lock" class="hidden">
+    <div class="lock-inner">
+      <div class="big">🦊</div>
+      <h2>FurryManager</h2>
+      <div id="lock-pin-row" class="hidden">
+        <input id="lock-pin" type="password" inputmode="numeric" placeholder="ПИН-код" autocomplete="off"/>
+        <button class="primary" id="lock-enter">Войти</button>
+      </div>
+      <button class="primary hidden" id="lock-show">Показать библиотеку</button>
+      <div id="lock-err" class="muted small"></div>
+      <button class="ghost small-btn hidden" id="lock-forgot">Забыл ПИН?</button>
+      <div id="lock-recovery" class="hidden">
+        <div class="muted small" style="margin-bottom:6px;">Введи код восстановления (выдавался при установке ПИН):</div>
+        <div style="display:flex; gap:6px; justify-content:center;">
+          <input id="lock-rec-code" type="text" placeholder="код" autocomplete="off"/>
+          <button class="secondary small-btn" id="lock-rec-btn">Сбросить по коду</button>
+        </div>
+        <div class="muted small" style="margin:10px 0 4px;">Нет кода? Можно запросить сброс: он сработает через 24 часа, если за это время ПИН ни разу не будет введён.</div>
+        <button class="secondary small-btn" id="lock-delay-btn">Запросить сброс через 24 ч</button>
+        <div id="lock-delay-info" class="muted small" style="margin-top:6px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Автосбор групп -->
+  <div id="autogroups" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="ag-close">✕</button>
+      <h2>🧩 Предложения групп</h2>
+      <p>Вариации найдены по визуальной похожести, комиксы — по общему названию из источника. Сними галочки с лишнего; порядок страниц потом можно поправить в редакторе группы.</p>
+      <div class="autocol-controls">
+        <label class="watch-mode"><input type="checkbox" id="ag-all" checked /> отметить все</label>
+        <span id="ag-status" class="muted small"></span>
+      </div>
+      <div id="ag-list"></div>
+      <div class="dupe-footer">
+        <button class="primary" id="ag-apply" disabled>Сгруппировать (0)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Редактор группы (комикс / вариации) -->
+  <div id="groupedit" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="ge-close">✕</button>
+      <h2>🧩 Группа</h2>
+      <div class="ge-controls">
+        <input id="ge-name" type="text" placeholder="Имя (для комикса — название)" autocomplete="off"/>
+        <button class="secondary small-btn" id="ge-e621" title="Найти название на e621 по первой странице (поиск по хешу файла → имя пула). Уходит в интернет — только по этому клику.">🌐 Имя с e621</button>
+        <select id="ge-kind">
+          <option value="variants">Вариации одного арта</option>
+          <option value="comic">Комикс (страницы по порядку)</option>
+        </select>
+      </div>
+      <div class="muted small" style="text-align:left; margin:6px 0 10px;">↑/↓ — порядок (для комикса это порядок страниц), ✕ — исключить из группы (арт останется в библиотеке).</div>
+      <div id="ge-list"></div>
+      <div class="dupe-footer" style="justify-content:space-between;">
+        <button class="danger" id="ge-dissolve">Распустить группу</button>
+        <button class="primary" id="ge-save">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Полная переиндексация -->
+  <div id="reindex" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="reindex-close">✕</button>
+      <h2>♻ Полная переиндексация</h2>
+      <p>Сотру все ИИ-вектора и автотеги (ручные теги останутся) и пройду библиотеку заново — включая видео и гифки. <b>Если библиотека большая, это займёт долго</b> (порядка 5–10 артов в секунду), но идёт в фоне — приложением можно пользоваться, а кнопка «Отменить» в тосте остановит процесс.</p>
+      <label class="watch-mode"><input type="checkbox" id="re-nsfw" /> после — распределить SFW/NSFW автоматически (сбросит ручные пометки, дальше по рейтингу ИИ)</label>
+      <label class="watch-mode" style="margin-top:8px;"><input type="checkbox" id="re-col" /> после — предложить распределение по коллекциям (с созданием новых, покажу предпросмотр)</label>
+      <div class="settings-footer">
+        <button class="primary" id="reindex-start">Начать переиндексацию</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Автораспределение по коллекциям -->
+  <div id="autocol" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="autocol-close">✕</button>
+      <h2>Авто-распределение по коллекциям</h2>
+      <p>Смотрю на теги артов и характерные теги твоих коллекций. Ничего не применяется, пока не нажмёшь кнопку — сначала проверь предложение и сними лишние галочки.</p>
+      <div class="autocol-controls">
+        <label class="watch-mode"><input type="checkbox" id="autocol-new" /> создавать новые коллекции (минимум из 3 артов, по общему тегу)</label>
+        <span id="autocol-status" class="muted small"></span>
+      </div>
+      <div id="autocol-list"></div>
+      <div class="dupe-footer">
+        <button class="primary" id="autocol-apply" disabled>Распределить (0)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Вводный гайд (первый запуск) -->
+  <div id="guide" class="hidden">
+    <div class="modal">
+      <div class="guide-slide" data-g="1">
+        <div class="big">🖼</div>
+        <h2>Библиотека и импорт</h2>
+        <p>Добавляй арты кнопкой <b>＋ Импорт</b> (папку целиком или отдельные файлы) или просто <b>перетащи файлы прямо в окно</b>. Я копирую их в библиотеку, убираю точные дубликаты и делаю превью. Оригиналы остаются на месте.</p>
+      </div>
+      <div class="guide-slide hidden" data-g="2">
+        <div class="big">🔎</div>
+        <h2>Поиск и теги</h2>
+        <p>Просто пиши слова — найду по тегам, автору и названию. Открой арт, чтобы добавить теги и разложить по <b>коллекциям</b> (как альбомы: один арт может быть в нескольких сразу, места это не занимает). Панель коллекций под поиском фильтрует галерею.</p>
+      </div>
+      <div class="guide-slide hidden" data-g="3">
+        <div class="big">🧠</div>
+        <h2>Умный поиск и автотеги</h2>
+        <p>Кнопка <b>🧠</b> справа вверху → «Проиндексировать»: локальная нейросеть повесит автотеги и включит умный поиск — можно описывать словами («рыжий лис в куртке»). Всё считается на твоём ПК; модели скачиваются один раз (~1 ГБ).</p>
+      </div>
+      <div class="guide-slide hidden" data-g="4">
+        <div class="big">🦊</div>
+        <h2>Сохранение из браузера</h2>
+        <p>Поставь браузерное расширение (инструкция и токен — в ⚙ Настройках) и сохраняй арты с e621, FurAffinity и сотен сайтов одним кликом, вместе с тегами и автором.</p>
+        <div class="privacy-box">🔒 Напоминание: приложение работает локально и выходит в интернет только когда ты сам просишь. Твоя коллекция никуда не уходит.</div>
+      </div>
+      <div class="guide-nav">
+        <button class="ghost" id="guide-skip">Пропустить</button>
+        <span id="guide-dots"></span>
+        <button class="primary" id="guide-next">Дальше →</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

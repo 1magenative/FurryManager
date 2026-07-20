@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>FurryManager Saver — настройки</title>
+  <style>
+    body { font: 14px/1.5 "Segoe UI", sans-serif; background: #1e1e26; color: #e8e6e3; padding: 24px; max-width: 480px; }
+    h2 { color: #f28c38; }
+    label { display: block; margin: 14px 0 4px; color: #9a97a3; }
+    input { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #3a3a46; background: #262631; color: #e8e6e3; box-sizing: border-box; }
+    button { margin-top: 16px; padding: 9px 18px; border: none; border-radius: 999px; background: #f28c38; color: #1b1206; font-weight: 600; cursor: pointer; }
+    #status { margin-left: 10px; color: #7ed67e; }
+    p.hint { color: #9a97a3; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>🦊 FurryManager Saver</h2>
+  <p class="hint">Токен и порт смотри в приложении FurryManager: <b>⚙ Настройки → Расширение браузера</b>. Приложение должно быть запущено, когда сохраняешь арты.</p>
+  <label for="token">Токен</label>
+  <input id="token" type="text" placeholder="вставь токен из FurryManager" />
+  <label for="port">Порт</label>
+  <input id="port" type="number" value="7877" />
+  <button id="save">Сохранить</button><span id="status"></span>
+  <script src="options.js"></script>
+</body>
+</html>

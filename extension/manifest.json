@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "FurryManager Saver",
+  "version": "0.3.0",
+  "description": "Сохраняет арты, гифки и видео с e621, FurAffinity и других сайтов в локальную библиотеку FurryManager одним кликом.",
+  "permissions": ["contextMenus", "storage", "notifications"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "FurryManager", "default_popup": "popup.html" },
+  "options_page": "options.html",
+  "icons": {
+    "32": "icons/32.png",
+    "128": "icons/128.png"
+  }
+}

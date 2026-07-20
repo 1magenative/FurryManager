@@ -1,0 +1,25 @@
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Собранный ИИ-сайдкар (PyInstaller) — большой, собирается локально
+sidecar/dist/*
+!sidecar/dist/PLACEHOLDER.txt
+sidecar/dist_build/
+sidecar/build/
+sidecar/__pycache__/
+*.pyc
+
+# Локальные артефакты
+*.log
+*.zip
+library.db
+library.db-wal
+library.db-shm
+
+# ОС / редакторы
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

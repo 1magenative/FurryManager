@@ -1,0 +1,54 @@
+# Сборка установщика при публикации тега (например: git tag v0.5.0 && git push --tags).
+# Готовый setup.exe прикрепляется к черновику релиза на GitHub.
+#
+# ВАЖНО: ИИ-сайдкар здесь НЕ собирается (PyInstaller + onnxruntime дают
+# ~500 МБ и долгую сборку). Установщик из этого workflow требует у
+# пользователя Python для ИИ-функций. Для «полного» релиза собирайте
+# локально через release.ps1 и прикладывайте файл к релизу вручную.
+
+name: build-installer
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.toml') }}
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Build installer
+        run: cargo tauri build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FurryManager-setup
+          path: src-tauri/target/release/bundle/nsis/*setup.exe
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: src-tauri/target/release/bundle/nsis/*setup.exe
