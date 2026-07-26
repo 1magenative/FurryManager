@@ -56,7 +56,16 @@
     flex:0 0 100vw; width:100vw; height:100%;
     display:flex; align-items:center; justify-content:center;
   }
-  .vslide img, .vslide video { max-width:100vw; max-height:100vh; object-fit:contain; }
+  .vslide img { max-width:100vw; max-height:100vh; object-fit:contain; }
+  .vslide video { max-width:100vw; max-height:100vh; object-fit:contain; }
+  /* Видео открыто: сверху освобождаем место под ✕/⬇ и нативную кнопку «на весь
+     экран» (iOS рисует её в углу видео), снизу — под плёнку миниатюр, чтобы её
+     не перекрывал ползунок перемотки. Плёнку НЕ прячем — она сидит под видео. */
+  #viewer.on-video .vslide {
+    box-sizing:border-box;
+    padding: calc(env(safe-area-inset-top) + 54px) 0 calc(env(safe-area-inset-bottom) + 96px);
+  }
+  #viewer.on-video .vslide video { max-height:100%; max-width:100%; }
   #vstrip {
     position:fixed; left:0; right:0; bottom:0; z-index:52;
     display:flex; gap:4px; overflow-x:auto;
@@ -148,6 +157,20 @@ if (params.get("token")) {
 }
 
 // Манифест PWA — с токеном, чтобы «На экран Домой» открывалось уже подключённым
+// Service Worker: нужен ТОЛЬКО для офлайн-запуска через Tailscale (https).
+// Без Tailscale (http в локальной сети) он не нужен — и там его не будет:
+// по http браузер SW не регистрирует, а если остался от прошлого — снимаем.
+function registerSW() {
+  if (!("serviceWorker" in navigator)) return;
+  if (location.protocol === "https:") {
+    navigator.serviceWorker.register("/sw.js").catch((e) => console.warn("SW:", e));
+  } else {
+    navigator.serviceWorker.getRegistrations()
+      .then((rs) => rs.forEach((r) => r.unregister()))
+      .catch(() => {});
+  }
+}
+
 function attachManifest() {
   if (!TOKEN) return;
   const l = document.createElement("link");
@@ -363,7 +386,8 @@ async function loadMore(reset = false) {
   } catch (e) {
     // ПК недоступен — показываем офлайн-копию, если она есть
     const pack = await idbGet("meta", "pack").catch(() => null);
-    if (reset && pack && pack.items && pack.items.length) {
+    const hasPack = pack && pack.items && pack.items.length;
+    if (reset && hasPack) {
       st.items = pack.items;
       st.end = true;
       st.offset = pack.items.length;
@@ -376,9 +400,15 @@ async function loadMore(reset = false) {
           : `<img loading="lazy" decoding="async" data-ck="t${f.id}" onload="this.classList.add('ld')" onerror="fmImgFallback(this)" src="${thumbUrl(f.id)}" alt=""/>`;
         return `<div class="c" data-i="${k}">${inner}${badge}<div class="b off">⤓</div></div>`;
       }).join("");
-      $("status").textContent = `📴 Нет связи с ПК — офлайн-копия «${pack.label}» (${pack.items.length})`;
+      $("status").textContent = `📴 ПК недоступен — показываю офлайн-копию «${pack.label}» (${pack.items.length}). ↻ обновит, когда будет связь.`;
+    } else if (hasPack) {
+      st.end = true; // догрузка без сети — офлайн-копия уже показана
     } else {
-      $("status").textContent = "Нет связи с ПК: " + e.message;
+      // Нет офлайн-копии именно на этом адресе (origin). Частая причина:
+      // арты качали на LAN-странице, а это Tailscale-адрес — хранилище своё.
+      $("grid").innerHTML = "";
+      $("status").textContent =
+        "📴 Нет связи с ПК. Офлайн-копии на этом устройстве ещё нет — подключись (включи Tailscale) и нажми ⤓, чтобы скачать арты для офлайна.";
     }
   } finally {
     st.loading = false;
@@ -481,6 +511,9 @@ function renderSlides() {
   s[0].innerHTML = slideHtml(vItems()[vIndex - 1], false);
   s[1].innerHTML = slideHtml(vItems()[vIndex], true);
   s[2].innerHTML = slideHtml(vItems()[vIndex + 1], false);
+  // Прячем плёнку миниатюр, если текущий слайд — видео (не мешаем перемотке)
+  const cur = vItems()[vIndex];
+  $("viewer").classList.toggle("on-video", !!cur && cur.kind === "video");
   resetZm(); // новый арт — зум по умолчанию
   setTrack(0, false);
   sizeCurrentMedia(); // фиксируем размер — картинка не прыгнет после загрузки
@@ -980,6 +1013,7 @@ $("add-link").addEventListener("click", async () => {
 
 async function boot() {
   attachManifest();
+  registerSW();
   await refreshOfflineIndex().catch(() => {});
   try {
     // Стартовый фильтр — тот же, что настроен на ПК («Фильтр при запуске»)

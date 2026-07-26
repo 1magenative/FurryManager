@@ -6,7 +6,7 @@
   <title>FurryManager</title>
   <link rel="stylesheet" href="style.css" />
 </head>
-<body data-mode="basic">
+<body data-mode="simple">
 
   <!-- Шапка -->
   <header id="topbar">
@@ -33,10 +33,12 @@
         <div class="menu-title" id="ai-status">…</div>
         <div class="menu-item" id="ai-run">🔄 Проиндексировать библиотеку</div>
         <div class="menu-item" id="ai-reindex">♻ Полная переиндексация…</div>
+        <div class="menu-item" id="ai-gif" title="Короткие видео (короче заданного порога) собрать в GIF. Порог и «заменять оригинал» — в ⚙ Организация.">🎞 Короткие видео → GIF</div>
         <div class="menu-item" id="ai-setup">⬇ Установить ИИ-компоненты</div>
         <div class="menu-item" id="ai-help">ℹ️ Что это?</div>
       </div>
     </div>
+    <button id="btn-ontop" class="ghost art" title="Окно поверх других (удобно рисовать рядом)">🔝</button>
     <button id="btn-health" class="ghost" title="Статистика и здоровье библиотеки">📊</button>
     <button id="btn-lock" class="ghost" title="Заблокировать шторкой прямо сейчас (Ctrl+L)">🔒</button>
     <button id="btn-dupes" class="ghost adv" title="Найти дубликаты и почти-копии">🧹</button>
@@ -47,8 +49,22 @@
   <!-- Панель статистики -->
   <div id="statsbar"></div>
 
-  <!-- Коллекции -->
-  <div id="collections-bar"></div>
+  <!-- Коллекции + сортировка -->
+  <div id="bar-row">
+    <div id="collections-bar"></div>
+    <span class="col-sep"></span>
+    <span id="sort-wrap">
+      <select id="sort-select" title="Порядок артов в галерее">
+        <option value="">Новые сверху</option>
+        <option value="old">Старые сверху</option>
+        <option value="big">Сначала крупные</option>
+        <option value="small">Сначала мелкие</option>
+        <option value="views">Часто смотрю</option>
+        <option value="random">Случайно</option>
+      </select>
+    </span>
+    <button id="sort-shuffle" class="ghost hidden" title="Перемешать заново">🎲</button>
+  </div>
 
   <!-- Галерея -->
   <main id="gallery-wrap">
@@ -90,6 +106,7 @@
   <div id="sel-panel" class="hidden"></div>
 
   <!-- Прогресс импорта -->
+  <div id="botstack">
   <div id="import-toast" class="hidden">
     <div class="toast-title">Импортирую…</div>
     <div class="progress"><div id="import-bar"></div></div>
@@ -97,9 +114,26 @@
     <button id="import-cancel" class="ghost small-btn hidden">✕ Отменить</button>
   </div>
 
+  <!-- Подсказка режима «поверх других окон» -->
+  <div id="ontop-hint" class="hidden">
+    🔝 Менеджер поверх других окон
+    <button id="ontop-off" class="ghost small-btn">Выключить</button>
+  </div>
+
+  <!-- Очередь задач (видна только когда задач больше одной) -->
+  <div id="taskq" class="hidden">
+    <div id="taskq-head">
+      <span id="taskq-count"></span>
+      <button id="taskq-toggle" class="ghost" title="Открыть/свернуть очередь">＾</button>
+    </div>
+    <div id="taskq-list" class="hidden"></div>
+  </div>
+  </div>
+
   <!-- Просмотрщик -->
   <div id="viewer" class="hidden">
     <button id="viewer-close" class="ghost close" title="Закрыть (Esc)">✕</button>
+    <button id="viewer-fav" class="ghost" title="В избранное (клавиша F)">☆</button>
     <button id="nav-prev" class="navbtn" title="Предыдущий (←)">‹</button>
     <button id="nav-next" class="navbtn" title="Следующий (→)">›</button>
     <div id="viewer-media"></div>
@@ -170,12 +204,16 @@
       <div class="ob-step hidden" data-step="3">
         <h2>Как тебе удобнее?</h2>
         <label class="radio-card">
-          <input type="radio" name="ob-mode" value="basic" checked />
-          <div><b>Базовый</b><br/><span class="muted">Просто галерея, поиск и теги. Рекомендую для начала — переключить можно в любой момент.</span></div>
+          <input type="radio" name="ob-mode" value="simple" checked />
+          <div><b>Упрощённый</b><br/><span class="muted">Просто галерея, поиск и теги. Рекомендую для начала — переключить можно в любой момент.</span></div>
         </label>
         <label class="radio-card">
-          <input type="radio" name="ob-mode" value="advanced" />
-          <div><b>Продвинутый</b><br/><span class="muted">Неймспейсы тегов (<code>раса:лис</code>), синтаксис поиска (<code>-эскиз</code>), тех. детали файлов.</span></div>
+          <input type="radio" name="ob-mode" value="user" />
+          <div><b>Пользователь</b><br/><span class="muted">Неймспейсы тегов (<code>раса:лис</code>), синтаксис поиска (<code>-эскиз</code>), дубликаты, автопапки.</span></div>
+        </label>
+        <label class="radio-card">
+          <input type="radio" name="ob-mode" value="artist" />
+          <div><b>Художник</b><br/><span class="muted">Всё выше + пипетка, окно поверх других, зеркало и поворот референса, сетка построения.</span></div>
         </label>
         <button class="primary" id="ob-finish">Поехали! 🚀</button>
       </div>
@@ -190,6 +228,7 @@
       <div class="set-layout">
       <nav class="set-nav">
         <button class="set-tab-btn active" data-tab="general">⚙ Общие</button>
+        <button class="set-tab-btn" data-tab="display">🎨 Отображение</button>
         <button class="set-tab-btn" data-tab="storage">💾 Хранение</button>
         <button class="set-tab-btn" data-tab="org">📚 Организация</button>
         <button class="set-tab-btn" data-tab="conn">📱 Подключения</button>
@@ -200,13 +239,18 @@
 
       <section class="set-tab active" data-tab="general">
       <div class="side-label" style="text-align:left; margin-bottom:8px;">Режим интерфейса</div>
+      <div class="muted small" style="text-align:left; margin-bottom:8px;">Режим только скрывает лишние кнопки — все данные и функции остаются на месте, переключить можно в любой момент.</div>
       <label class="radio-card">
-        <input type="radio" name="set-mode" value="basic" />
-        <div><b>Базовый</b><br/><span class="muted">Галерея, поиск, простые теги.</span></div>
+        <input type="radio" name="set-mode" value="simple" />
+        <div><b>Упрощённый</b><br/><span class="muted">Только самое нужное: галерея, поиск, коллекции, простые теги. Без инструментов «для профи».</span></div>
       </label>
       <label class="radio-card">
-        <input type="radio" name="set-mode" value="advanced" />
-        <div><b>Продвинутый</b><br/><span class="muted">Неймспейсы тегов (<code>раса:лис</code>), синтаксис поиска (<code>-эскиз</code>), тех. детали.</span></div>
+        <input type="radio" name="set-mode" value="user" />
+        <div><b>Пользователь</b><br/><span class="muted">Плюс неймспейсы тегов (<code>раса:лис</code>), синтаксис поиска (<code>-эскиз</code>), дубликаты, связи тегов, автопапки.</span></div>
+      </label>
+      <label class="radio-card">
+        <input type="radio" name="set-mode" value="artist" />
+        <div><b>Художник</b><br/><span class="muted">Всё из «Пользователя» + инструменты для рисования: 🎨 пипетка, окно поверх других, зеркало и поворот референса, сетка построения.</span></div>
       </label>
 
       <div class="side-label" style="text-align:left; margin:16px 0 8px;">Контент</div>
@@ -225,6 +269,44 @@
         </label>
         <span class="muted small">Какая вкладка активна при каждом открытии приложения.</span>
       </div>
+      </section>
+
+      <section class="set-tab" data-tab="display">
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">Тема</div>
+      <div class="muted small" style="text-align:left; margin-bottom:8px;">Нейтрально-серая — для оценки цвета: на чёрном фоне цвета кажутся светлее и насыщеннее, чем есть.</div>
+      <div class="set-subopt" style="margin-left:0; border-left:none; padding-left:0; display:flex; gap:14px; flex-wrap:wrap;">
+        <label><input type="radio" name="set-theme" value="dark" /> Тёмная</label>
+        <label><input type="radio" name="set-theme" value="gray" /> Нейтрально-серая</label>
+        <label><input type="radio" name="set-theme" value="light" /> Светлая</label>
+      </div>
+
+      <div class="side-label" style="text-align:left; margin:18px 0 8px;">Галерея</div>
+      <div class="set-subopt" style="margin-left:0; border-left:none; padding-left:0;">
+        <label style="display:flex; align-items:center; gap:10px;">Размер миниатюр:
+          <input type="range" id="set-grid-size" min="120" max="360" step="20" style="flex:1; max-width:220px;"/>
+          <span class="muted small" id="set-grid-size-val"></span>
+        </label>
+      </div>
+      <label class="radio-card" style="margin-top:10px;">
+        <input type="checkbox" id="set-masonry" />
+        <div><b>«Водопад» вместо квадратов</b><br/>
+        <span class="muted">Миниатюры сохраняют пропорции — вертикальные арты видно целиком, без обрезки.</span></div>
+      </label>
+      <label class="radio-card" style="margin-top:8px;">
+        <input type="checkbox" id="set-hide-badges" />
+        <div><b>Скрыть подписи на миниатюрах</b><br/>
+        <span class="muted">Без бейджей GIF / ▶ видео / 🧩 стопка и процентов совпадения — чистая сетка.</span></div>
+      </label>
+      <label class="radio-card" style="margin-top:8px;">
+        <input type="checkbox" id="set-compact" />
+        <div><b>Компактный режим</b><br/>
+        <span class="muted">Скрывает строку статистики — на экран попадает больше артов.</span></div>
+      </label>
+      <label class="radio-card" style="margin-top:8px;">
+        <input type="checkbox" id="set-hide-colscroll" />
+        <div><b>Скрыть полосу прокрутки у коллекций</b><br/>
+        <span class="muted">Панель станет ровно в одну строку с сортировкой. Прокрутка остаётся: колесом мыши над панелью.</span></div>
+      </label>
       </section>
 
       <section class="set-tab" data-tab="storage">
@@ -250,6 +332,22 @@
       <div class="btn-row" style="margin-top:8px;">
         <button class="secondary" id="btn-repair" title="Ищет арты без превью, распознаёт HEIC-фото, сохранённые с неверным расширением (проделка iOS), конвертирует их в JPEG и восстанавливает превью">🔧 Починить битые импорты</button>
       </div>
+
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Корзина</div>
+      <label class="radio-card">
+        <input type="checkbox" id="set-use-trash" />
+        <div><b>Удалять через корзину</b><br/>
+        <span class="muted">Удалённые арты можно вернуть вместе с тегами и коллекциями. Если выключить — удаление сразу безвозвратное (место освобождается мгновенно).</span></div>
+      </label>
+      <div class="set-subopt" id="trash-days-wrap" style="margin-left:0; border-left:none; padding-left:0; margin-top:8px;">
+        <label>Очищать корзину через:
+          <input type="number" id="set-trash-days" min="0" max="365" step="1" style="width:64px; background:var(--bg3); border:1px solid var(--line); border-radius:8px; color:var(--text); padding:5px 8px;"/> дней
+        </label>
+        <span class="muted small">0 — не очищать автоматически. Считается по дате удаления, поэтому просроченное подчистится при следующем запуске, даже если приложение долго не открывали.</span>
+      </div>
+      <div class="btn-row" style="margin-top:8px;">
+        <button class="secondary" id="btn-trash">🗑 Открыть корзину<span id="trash-badge"></span></button>
+      </div>
       <div class="side-label" style="text-align:left; margin:16px 0 8px;">Резервная копия / перенос</div>
       <div class="muted small" style="text-align:left; margin-bottom:8px;">Экспорт собирает всю библиотеку в один zip: арты, превью, база (теги, коллекции, группы) и настройки. Импорт разворачивает такой архив в текущую библиотеку — <b>база заменяется базой из архива</b>. Арты «без копирования» (in-place) в архив не попадают.</div>
       <div class="btn-row">
@@ -259,14 +357,34 @@
       </section>
 
       <section class="set-tab" data-tab="org">
-      <div class="side-label" style="text-align:left; margin-bottom:8px;">Коллекции</div>
-      <div id="set-collections"></div>
-      <div class="muted small" style="text-align:left; margin-top:4px;">Порядок — стрелками ↑/↓, ✎ — переименовать, 🗑 — удалить (арты останутся в библиотеке). Создать новую коллекцию можно на главном экране, в панели под поиском.</div>
-
-      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Теги</div>
+      <div class="side-label" style="text-align:left; margin-bottom:8px;">Теги</div>
       <div class="btn-row">
         <button class="secondary" id="btn-tagmgr">🏷 Менеджер тегов (переименовать / слить / удалить)</button>
       </div>
+
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Видео → GIF</div>
+      <label class="radio-card">
+        <input type="checkbox" id="set-gif-auto" />
+        <div><b>Короткие видео конвертировать в GIF</b><br/>
+        <span class="muted">При импорте видео короче порога собирается GIF (кадры снимает приложение, ffmpeg не нужен). Переконвертировать уже имеющиеся — 🧠 → «🎞 Короткие видео → GIF».</span></div>
+      </label>
+      <div class="set-subopt" style="margin-left:0; border-left:none; padding-left:0; margin-top:8px; display:flex; flex-wrap:wrap; gap:14px;">
+        <label>Порог, сек:
+          <input type="number" id="set-gif-secs" min="1" max="60" step="1" style="width:56px; background:var(--bg3); border:1px solid #34343f; border-radius:8px; color:var(--text); padding:5px 8px;"/>
+        </label>
+        <label>Кадров/сек:
+          <input type="number" id="set-gif-fps" min="5" max="30" step="1" style="width:56px; background:var(--bg3); border:1px solid #34343f; border-radius:8px; color:var(--text); padding:5px 8px;"/>
+        </label>
+        <label>Макс. сторона, px:
+          <input type="number" id="set-gif-width" min="120" max="960" step="20" style="width:72px; background:var(--bg3); border:1px solid #34343f; border-radius:8px; color:var(--text); padding:5px 8px;"/>
+        </label>
+      </div>
+      <div class="muted small" style="text-align:left; margin-top:4px;">Больше кадров/сек и размер — плавнее и чётче, но GIF тяжелее. GIF всегда ограничен 256 цветами, поэтому цвета беднее исходного видео (это ограничение формата).</div>
+      <label class="radio-card" style="margin-top:8px;">
+        <input type="checkbox" id="set-gif-replace" />
+        <div><b>Заменять оригинал на GIF</b><br/>
+        <span class="muted">Выключено — хранятся и видео, и GIF. Включено — остаётся только GIF.</span></div>
+      </label>
 
       <div class="adv">
       <div class="side-label" style="text-align:left; margin:16px 0 8px;">Связи тегов (синонимы и импликации)</div>
@@ -288,6 +406,10 @@
       <div class="btn-row" style="margin:8px 0;"><button class="secondary small-btn" id="watch-add">＋ Добавить папку…</button></div>
       <div id="watch-list"></div>
       </div>
+
+      <div class="side-label" style="text-align:left; margin:18px 0 8px;">Коллекции</div>
+      <div id="set-collections"></div>
+      <div class="muted small" style="text-align:left; margin-top:4px;">Порядок — стрелками ↑/↓, ✎ — переименовать, 🗑 — удалить (арты останутся). Список внизу, чтобы не мешал остальным настройкам. Рейтинг (авто/SFW/NSFW — для скрытия NSFW) выбирается тут же. Создать новую коллекцию — на главном экране, в панели под поиском.</div>
       </section>
 
       <section class="set-tab" data-tab="conn">
@@ -315,6 +437,15 @@
       </div>
       <div class="muted small" style="text-align:left; margin-top:4px;">FurAffinity и e621 отдают взрослый контент только залогиненным. Скачивание возьмёт куки твоей сессии из выбранного браузера — качается ровно то, что видишь сам. Куки читаются локально и никуда не отправляются; браузер при этом лучше закрыть (он держит файл куки заблокированным).</div>
 
+      <div class="side-label" style="text-align:left; margin:16px 0 8px;">Загрузка из Telegram</div>
+      <p style="text-align:left; font-size:12px;">Отдельный бот-загрузчик: пересылаешь ему фото, видео или гиф (в том числе <b>пересланные</b> из каналов) — и они попадают в библиотеку. Текст игнорируется. Заведи бота у <b>@BotFather</b>, скопируй токен и вставь сюда. Присланное подхватывается, пока приложение запущено (и при следующем запуске — что скопилось за ~сутки). Большие видео (>20 МБ) Telegram боту не отдаёт.</p>
+      <div style="display:flex; gap:6px;">
+        <input id="tg-token" type="password" placeholder="токен бота (123456:ABC…)" autocomplete="off" style="flex:1; background:var(--bg3); border:1px solid #34343f; border-radius:8px; color:var(--text); padding:7px 10px;"/>
+        <button class="secondary small-btn" id="tg-connect">Подключить</button>
+        <button class="ghost small-btn hidden" id="tg-disconnect">Отключить</button>
+      </div>
+      <div id="tg-status" class="muted small" style="text-align:left; margin-top:4px;"></div>
+
       <div class="side-label" style="text-align:left; margin:16px 0 8px;">Доступ с телефона</div>
       <label class="radio-card">
         <input type="checkbox" id="set-lan" />
@@ -326,6 +457,21 @@
         <div class="lan-info">
           <div id="lan-url" class="muted small"></div>
           <div class="muted small">Отсканируй QR камерой телефона — откроется мобильная страница библиотеки (галерея, поиск, загрузка артов). Там же «Поделиться → На экран Домой» превратит её в приложение. После включения или выключения галочки <b>перезапусти приложение</b>.</div>
+        </div>
+      </div>
+
+      <div class="side-label" style="text-align:left; margin:18px 0 8px;">Офлайн-галерея на телефоне (Tailscale)</div>
+      <p style="text-align:left; font-size:12px;">Чтобы мобильная галерея открывалась <b>даже без сети</b> (и работала вне дома), нужен доверенный HTTPS. Его бесплатно даёт <b>Tailscale</b>: поставь его на этот ПК и на телефон, войди в один аккаунт — и нажми кнопку. При первом включении Windows покажет <b>запрос прав администратора — нажми «Да»</b> (иначе Tailscale не даёт настроить доступ). Появятся адрес и QR: открой на телефоне и «Поделиться → На экран Домой». После первого захода приложение запомнит арты (скачиваются кнопкой ⤓ в галерее) и будет открываться офлайн.</p>
+      <div class="btn-row" style="justify-content:flex-start; gap:8px;">
+        <button class="secondary" id="ts-enable">🔒 Включить доступ через Tailscale</button>
+        <button class="ghost small-btn hidden" id="ts-disable">Выключить</button>
+      </div>
+      <div id="ts-status" class="muted small" style="text-align:left; margin-top:6px;"></div>
+      <div id="ts-setup" class="lan-setup hidden">
+        <div id="ts-qr"></div>
+        <div class="lan-info">
+          <div id="ts-url" class="muted small"></div>
+          <div class="muted small">Открой этот адрес на телефоне (или отсканируй QR) → «Поделиться → На экран Домой». Дальше галерея открывается офлайн. Если Tailscale не установлен — скачай его с <b>tailscale.com/download</b> на ПК и из App Store на iPhone, войди в один аккаунт и нажми кнопку снова. Если телефон не подключается к адресу — в админке Tailscale включи HTTPS-сертификаты (login.tailscale.com → DNS → «HTTPS Certificates»).</div>
         </div>
       </div>
       </section>
@@ -351,6 +497,15 @@
           </label>
           <div class="muted small" style="margin-top:4px;">«При сворачивании и Win+L» не срабатывает от простого переключения на другое окно. Возврат — по ПИН (если включён) или кнопкой. Применяется по кнопке «Сохранить».</div>
         </div>
+      </div>
+      <div class="pin-box">
+        <b>Тотальное скрытие NSFW</b>
+        <div class="muted small" style="margin:4px 0 8px;">Прячет NSFW-коллекции (и их названия), выключает и блокирует NSFW-фильтр — на экране остаются только безопасные арты. Удобно, когда рядом коллеги. Горячая клавиша: <b>Ctrl+Shift+H</b>. При включённом ПИН для <b>выключения</b> режима спросит ПИН. Что считать NSFW-коллекцией — задаётся у каждой коллекции (авто/SFW/NSFW) в ⚙ Организация.</div>
+        <label class="radio-card">
+          <input type="checkbox" id="set-hide-nsfw" />
+          <div><b>Скрывать всё NSFW сейчас</b><br/>
+          <span class="muted">Применяется сразу, сохраняется между запусками.</span></div>
+        </label>
       </div>
       <div class="privacy-box">🔒 <b>Всё локально.</b> FurryManager хранит и обрабатывает арты и теги только на этом компьютере. Ничего не отправляется в интернет, нет аккаунтов, облака и аналитики. Приложение выходит в сеть <b>лишь по твоей команде</b>: скачать арт по ссылке из браузерного расширения, а по кнопке «🌐 В интернете» — найти источник/похожее. ИИ-индексация и умный поиск работают офлайн (модели скачиваются один раз при установке).</div>
       </section>
@@ -397,7 +552,11 @@
       <p><b>Похожие.</b> «📁 В библиотеке» — дубликаты и почти-копии среди твоих файлов (после индексации — похожие по стилю и содержанию). «🔎 Найти источник» — обратный поиск по FurAffinity, e621, Weasyl, Twitter (через Fluffle.xyz): находит <b>этот же</b> арт на сайтах, автора и первоисточник. «🏷 Похожее по тегам» — открывает на e621/danbooru/FurAffinity поиск по тегам этого арта (можно выбрать какие): так находятся <b>другие</b> арты на ту же тему. Автотеги совпадают со словарём e621/danbooru, поэтому там результат точнее, чем на FA. Найденные «в библиотеке» похожие интерактивны: клик открывает арт, ПКМ — копировать/проводник/в группу/удалить; кнопка «Показать все» внизу открывает похожих прямо в галерее — у поиска появится чип с образцом (клик по нему возвращает к арту, ✕ снимает фильтр).</p>
       <p><b>ИИ (🧠).</b> Кнопка 🧠 справа вверху → «Проиндексировать»: локальная нейросеть просмотрит арты, повесит автотеги (раса, одежда, рейтинг — помечены как авто) и включит <b>умный поиск</b>: жми 🧠 в строке поиска и описывай словами — «рыжий лис в куртке» (лучше по-английски: «red fox in jacket»). Всё работает локально, в интернет арты не отправляются. Первый запуск скачает модели (~1 ГБ). Видео и гифки индексируются по кадру-превью. «♻ Полная переиндексация» стирает автотеги и вектора и проходит библиотеку заново — с опциями авто-SFW/NSFW и раскладки по коллекциям после.</p>
       <p><b>Переустановка и удаление.</b> Библиотека живёт в отдельной папке (её путь — в ⚙ Настройках → Хранение, кнопка «Показать» откроет её в проводнике), а не внутри программы. Поэтому <b>удаление менеджера не удаляет арты</b>: уходят только файлы приложения и ярлыки. Галочка «Удалить данные приложения» в деинсталляторе стирает настройки и ПИН — библиотеку она тоже не трогает. Чтобы вернуться, поставь менеджер заново и укажи ту же папку: теги, коллекции и группы будут на месте. Стереть библиотеку можно только вручную, удалив её папку. Резервная копия — ⚙ Настройки → Хранение → «Экспорт библиотеки» (один zip со всеми файлами и базой).</p>
-      <p class="muted small">Горячие клавиши: <code>Esc</code> — закрыть, <code>/</code> — в поиск, <code>Ctrl+L</code> — заблокировать шторкой, <code>Ctrl+Shift+A</code> — выделить всё, <code>←</code> <code>→</code> — листать в просмотрщике, <code>Delete</code> — удалить открытый арт.</p>
+      <p><b>Избранное и порядок.</b> ★ — быстрая пометка «моё любимое»: правый клик по арту → «★ В избранное» или клавиша <code>F</code> (работает и для выделенных). Чип «★ Избранное» в панели показывает только их. Справа от панели — порядок галереи: новые/старые, крупные/мелкие, «часто смотрю» и <b>случайно</b> (удобно, когда хочется наткнуться на забытое).</p>
+      <p><b>Корзина.</b> Удалённые арты по умолчанию попадают в корзину и восстанавливаются вместе с тегами, коллекциями и источником: ⚙ Настройки → Хранение → «Открыть корзину». Там же можно выключить корзину (тогда удаление сразу безвозвратное) и задать, через сколько дней чистить её автоматически — срок считается по дате удаления, так что просроченное подчистится даже после долгого перерыва.</p>
+      <p><b>Внешний вид.</b> ⚙ Настройки → Отображение: тема (тёмная / нейтрально-серая / светлая — серая не искажает восприятие цвета), размер миниатюр, «водопад» вместо квадратов (вертикальные арты видно целиком), скрытие подписей и компактный режим.</p>
+      <p><b>Режимы интерфейса.</b> «Упрощённый» — только галерея, поиск и коллекции. «Пользователь» — плюс неймспейсы тегов, синтаксис поиска, дубликаты, связи тегов и автопапки. «Художник» — плюс инструменты рисования: 🎨 пипетка, 🪞 зеркало и поворот, ▦ сетка построения (всё в ПКМ по арту в просмотрщике) и два способа держать реф под рукой: <b>🖼 «Открыть арт поверх окон»</b> — отдельное маленькое окно только с артом (со своим зеркалом, поворотом и прозрачностью; закрывается крестиком окна) и <b>🔝</b> в шапке — поверх окон становится весь менеджер (тогда по краю появится оранжевая рамка и подсказка «Выключить»). Режим меняется в ⚙ Настройки → Общие и только скрывает кнопки, данные не затрагивает.</p>
+      <p class="muted small">Горячие клавиши: <code>Esc</code> — закрыть, <code>/</code> — в поиск, <code>F</code> — избранное, <code>Ctrl+L</code> — заблокировать шторкой, <code>Ctrl+Shift+A</code> — выделить всё, <code>Ctrl+Shift+H</code> — скрыть NSFW, <code>←</code> <code>→</code> — листать в просмотрщике, <code>Delete</code> — удалить открытый арт.</p>
     </div>
   </div>
 
@@ -582,6 +741,62 @@
         <button class="ghost" id="guide-skip">Пропустить</button>
         <span id="guide-dots"></span>
         <button class="primary" id="guide-next">Дальше →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Корзина -->
+  <div id="trash" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="trash-close">✕</button>
+      <h2>🗑 Корзина</h2>
+      <p>Удалённые арты. «Восстановить» вернёт их в библиотеку вместе с тегами, коллекциями и источником. Оригиналы вне библиотеки не затрагивались.</p>
+      <div class="autocol-controls">
+        <label class="watch-mode"><input type="checkbox" id="trash-all" /> отметить все</label>
+        <span id="trash-status" class="muted small"></span>
+      </div>
+      <div id="trash-list"></div>
+      <div class="dupe-footer" style="gap:8px;">
+        <button class="primary" id="trash-restore" disabled>↩ Восстановить (0)</button>
+        <button class="secondary" id="trash-del" disabled>🗑 Удалить навсегда (0)</button>
+        <button class="ghost small-btn" id="trash-empty">Очистить корзину</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Конвертация выбранных видео в GIF (ПКМ) -->
+  <div id="gifconv" class="hidden">
+    <div class="modal">
+      <button class="ghost close" id="gifconv-close">✕</button>
+      <h2>🎞 Видео → GIF</h2>
+      <div class="muted small" id="gifconv-count" style="margin-bottom:8px;"></div>
+      <div class="set-subopt" style="display:flex; flex-wrap:wrap; gap:14px; margin-left:0; border-left:none; padding-left:0;">
+        <label>Кадров/сек:
+          <input type="number" id="gifconv-fps" min="5" max="30" step="1" style="width:56px; background:var(--bg3); border:1px solid #34343f; border-radius:8px; color:var(--text); padding:5px 8px;"/>
+        </label>
+        <label>Макс. сторона, px:
+          <input type="number" id="gifconv-width" min="120" max="960" step="20" style="width:72px; background:var(--bg3); border:1px solid #34343f; border-radius:8px; color:var(--text); padding:5px 8px;"/>
+        </label>
+      </div>
+      <label class="radio-card" style="margin-top:10px;">
+        <input type="checkbox" id="gifconv-replace" />
+        <div><b>Заменять оригинал на GIF</b><br/><span class="muted">Выключено — останутся и видео, и GIF.</span></div>
+      </label>
+      <div class="muted small" style="margin-top:6px;">Длительность не ограничена — видео конвертируется целиком. GIF ограничен 256 цветами.</div>
+      <div class="dupe-footer"><button class="primary" id="gifconv-go">Конвертировать</button></div>
+    </div>
+  </div>
+
+  <!-- Аварийный экран старта: показывается вместо «белизны», если запуск
+       не удался или библиотека недоступна (диск/сеть) -->
+  <div id="boot-error" class="hidden">
+    <div class="lock-inner">
+      <div class="big">🦊</div>
+      <h2>FurryManager</h2>
+      <div id="boot-error-msg" class="muted" style="max-width:420px; line-height:1.5;"></div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:center;">
+        <button class="primary" id="boot-retry">↻ Повторить</button>
+        <button class="secondary" id="boot-pick">📁 Указать папку библиотеки</button>
       </div>
     </div>
   </div>

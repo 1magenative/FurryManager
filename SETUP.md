@@ -1,4 +1,9 @@
-# Установка окружения и запуск (Windows, с нуля)
+# Установка окружения и запуск (с нуля)
+
+> Ниже — инструкция для **Windows**. Для **Ubuntu/Linux** смотри отдельный
+> раздел в конце файла: [Ubuntu / Linux](#ubuntu--linux).
+
+## Windows
 
 Node.js **не нужен** — фронтенд без сборщика. Ставим только Rust и его инструменты. Всё делается один раз, займёт ~30–60 минут (в основном ожидание установок).
 
@@ -99,9 +104,93 @@ python -m pip install -r sidecar\requirements.txt
 
 Для FA/e621 с возрастными фильтрами gallery-dl может брать куки из браузера — если что-то не скачивается, напиши, настроим.
 
+# Ubuntu / Linux
+
+Проверялось на Ubuntu 22.04 и 24.04 (GNOME). Node.js так же не нужен.
+
+## Шаг 1. Системные библиотеки
+
+```bash
+sudo apt update
+sudo apt install -y build-essential curl wget file libssl-dev \
+  libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libxdo-dev \
+  libayatana-appindicator3-dev pkg-config
+```
+
+На Ubuntu 22.04 пакет вебвью может называться `libwebkit2gtk-4.0-dev` — ставь
+тот, который найдётся.
+
+## Шаг 2. Видео: кодеки и ffmpeg (важно)
+
+Вебвью в Linux — WebKitGTK, и «из коробки» он не проигрывает MP4/H.264. Без
+кодеков видео не будет воспроизводиться в просмотрщике:
+
+```bash
+sudo apt install -y gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+  gstreamer1.0-plugins-ugly gstreamer1.0-libav
+```
+
+Дополнительно поставь **ffmpeg** — это заметный плюс Linux-версии:
+
+```bash
+sudo apt install -y ffmpeg
+```
+
+С ним кадры для превью и ИИ-индексации видео извлекает сам бэкенд, а не
+браузерный движок: индексация точнее и не зависит от кодеков вебвью (в Windows
+ffmpeg обычно нет, и кадры снимает интерфейс — это медленнее).
+
+## Шаг 3. Rust и Tauri CLI
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+cargo install tauri-cli --locked
+```
+
+## Шаг 4. Python для ИИ (если не используешь готовый бинарник ИИ-модуля)
+
+```bash
+sudo apt install -y python3 python3-pip python3-venv
+```
+
+В Ubuntu 24.04+ системный Python защищён (PEP 668). Приложение это понимает:
+кнопка «⬇ Установить ИИ-компоненты» при отказе повторит установку с
+`--break-system-packages`. Чище — собрать автономный ИИ-модуль (шаг 6).
+
+## Шаг 5. Запуск
+
+```bash
+cd ~/FurryManager
+cargo tauri dev
+```
+
+## Шаг 6. Сборка дистрибутива (.deb / AppImage)
+
+```bash
+bash sidecar/build.sh     # автономный ИИ-модуль (долго, опционально)
+bash release.sh           # приложение + пакеты
+```
+
+Готовое — в `src-tauri/target/release/bundle/` (deb, appimage).
+Установка: `sudo apt install ./FurryManager_0.6.0_amd64.deb`
+
+## Отличия Linux-версии
+
+| Функция | Состояние |
+|---|---|
+| Галерея, теги, коллекции, группы, поиск, ИИ | Работает так же |
+| Сервер для телефона, PWA, Telegram-бот | Работает так же |
+| Шторка при сворачивании | Работает |
+| Отдельное событие «Win+L» (блокировка экрана) | Только Windows; шторка всё равно срабатывает при сворачивании |
+| Скрытие папок библиотеки от файлового менеджера | Через `.hidden` и `.nomedia` (GNOME Files, галереи), а не атрибутами файлов |
+| Видео (превью, индексация, GIF) | Нужны кодеки из шага 2; с установленным ffmpeg кадры извлекает бэкенд — работает лучше, чем в Windows |
+| Вставка картинки из буфера | Зависит от окружения: под Wayland WebKitGTK иногда не отдаёт картинку из буфера — тогда используй импорт файлом |
+| Tailscale | Нужно один раз разрешить: `sudo tailscale set --operator=$USER` |
+
 # Если что-то пошло не так
 
-Скопируй текст ошибки из PowerShell целиком и пришли мне — починю. Типичные случаи:
+Скопируй текст ошибки из PowerShell (или терминала) целиком и пришли мне — починю. Типичные случаи:
 
 | Симптом | Причина |
 |---|---|
@@ -110,3 +199,6 @@ python -m pip install -r sidecar\requirements.txt
 | `cargo: command not found` | Не перезапущен PowerShell после шага 2 |
 | Белое окно без интерфейса | Нет WebView2 (шаг 4) |
 | Картинки не отображаются | Пришли мне — вероятно, надо поправить scope asset-протокола |
+| **Linux:** `error: failed to run custom build command for webkit2gtk` | Не установлен `libwebkit2gtk-4.1-dev` (шаг 1) |
+| **Linux:** видео не проигрывается, нет превью | Не установлены gstreamer-кодеки (шаг 2) |
+| **Linux:** `externally-managed-environment` при установке ИИ | PEP 668 — приложение повторит с `--break-system-packages`; либо собери автономный ИИ-модуль |

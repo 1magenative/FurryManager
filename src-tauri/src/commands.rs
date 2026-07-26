@@ -44,6 +44,28 @@ pub struct Config {
     pub pin_reset_at: Option<i64>, // unix: когда запрошен отложенный сброс ПИН
     #[serde(default)]
     pub browser_cookies: Option<String>, // chrome|firefox|edge|"" — куки для gallery-dl
+    #[serde(default)]
+    pub hide_nsfw: Option<bool>, // режим тотального скрытия NSFW (коллекции + фильтр)
+    #[serde(default)]
+    pub tg_bot: Option<bool>, // Telegram-бот-загрузчик включён
+    #[serde(default)]
+    pub tg_token: Option<String>, // токен бота (@BotFather)
+    #[serde(default)]
+    pub tg_offset: Option<i64>, // последний обработанный update_id + 1 (getUpdates)
+    #[serde(default)]
+    pub video_gif: Option<bool>, // авто-конвертация коротких видео в GIF
+    #[serde(default)]
+    pub video_gif_secs: Option<i64>, // порог длительности (сек)
+    #[serde(default)]
+    pub video_gif_replace: Option<bool>, // заменять оригинал видео на GIF
+    #[serde(default)]
+    pub video_gif_fps: Option<i64>, // кадров/сек в GIF
+    #[serde(default)]
+    pub video_gif_width: Option<i64>, // макс. сторона GIF, px
+    #[serde(default)]
+    pub use_trash: Option<bool>, // удалять через корзину (иначе — сразу навсегда)
+    #[serde(default)]
+    pub trash_days: Option<i64>, // через сколько дней чистить корзину (0 = никогда)
 }
 
 /// Папка под наблюдением: новые файлы автоматически импортируются.
@@ -103,7 +125,7 @@ pub fn load_config() -> Config {
         .unwrap_or_default()
 }
 
-fn save_config(c: &Config) -> Result<(), String> {
+pub fn save_config(c: &Config) -> Result<(), String> {
     let p = config_path();
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
@@ -128,17 +150,19 @@ pub struct FileCard {
     pub group_name: Option<String>,
     pub stack2: Option<String>, // превью 2-й страницы (для стопки в галерее)
     pub stack3: Option<String>, // превью 3-й страницы
+    pub favorite: bool,
 }
 
-// Групповые колонки — строго в конец (индексы 8–12); дополнительные колонки
-// конкретных запросов (sha256, embedding) идут после них (индекс 13).
+// Групповые колонки — индексы 8–12, избранное — 13; дополнительные колонки
+// конкретных запросов (sha256, embedding) идут после них (индекс 14).
 const CARD_COLS: &str = "f.id, f.kind, f.ext, f.width, f.height, f.size, f.rel_path, f.thumb_rel, \
     f.group_id, COALESCE((SELECT COUNT(*) FROM files fg WHERE fg.group_id = f.group_id), 0), \
     (SELECT g.name FROM groups g WHERE g.id = f.group_id), \
     (SELECT COALESCE(f2.thumb_rel, f2.rel_path) FROM files f2 WHERE f2.group_id = f.group_id \
      ORDER BY COALESCE(f2.group_pos, 0), f2.id LIMIT 1 OFFSET 1), \
     (SELECT COALESCE(f3.thumb_rel, f3.rel_path) FROM files f3 WHERE f3.group_id = f.group_id \
-     ORDER BY COALESCE(f3.group_pos, 0), f3.id LIMIT 1 OFFSET 2)";
+     ORDER BY COALESCE(f3.group_pos, 0), f3.id LIMIT 1 OFFSET 2), \
+    COALESCE(f.favorite, 0)";
 
 /// Обложка группы: сам файл вне группы, либо первый по порядку внутри неё.
 pub(crate) const GROUP_COVER_WHERE: &str = " AND (f.group_id IS NULL OR NOT EXISTS (\
@@ -167,6 +191,7 @@ fn card_from_row(root: &Path, row: &rusqlite::Row) -> rusqlite::Result<FileCard>
         stack3: row
             .get::<_, Option<String>>(12)?
             .map(|t| root.join(t).to_string_lossy().into_owned()),
+        favorite: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -197,9 +222,32 @@ pub struct SetupState {
     pub browser_cookies: String,
     pub app_version: String,
     pub library_ok: bool, // папка библиотеки на месте и база открывается
+    pub hide_nsfw: bool,  // режим тотального скрытия NSFW включён
+    pub video_gif: bool,
+    pub video_gif_secs: i64,
+    pub video_gif_replace: bool,
+    pub video_gif_fps: i64,
+    pub video_gif_width: i64,
+    pub use_trash: bool,
+    pub trash_days: i64,
 }
 
 const PIN_RESET_DELAY: i64 = 24 * 3600; // отложенный сброс ПИН — сутки
+
+/// Доступна ли библиотека (папка существует и база открывается), но не дольше
+/// `timeout`. Проверку делает отдельный поток; если он завис на I/O мёртвого
+/// пути — возвращаем false и не блокируем вызывающий код. Зависший поток
+/// отвяжется сам, когда ОС отдаст свой таймаут.
+fn check_library_ok_timed(root: &str, timeout: std::time::Duration) -> bool {
+    let root = root.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let p = std::path::Path::new(&root);
+        let ok = p.is_dir() && db::open(&p.join("library.db")).is_ok();
+        let _ = tx.send(ok);
+    });
+    rx.recv_timeout(timeout).unwrap_or(false)
+}
 
 #[tauri::command]
 pub fn get_setup_state() -> SetupState {
@@ -218,14 +266,13 @@ pub fn get_setup_state() -> SetupState {
             pin_reset_remaining = Some(left);
         }
     }
-    // Библиотека могла переехать/остаться на отключённом диске — проверяем
+    // Библиотека могла переехать/остаться на отключённом диске — проверяем.
+    // С таймаутом: is_dir()/db::open на мёртвом сетевом/внешнем пути висят на
+    // таймауте ОС (десятки секунд), а это подвесило бы весь запуск интерфейса.
     let library_ok = c
         .library_root
         .as_ref()
-        .map(|r| {
-            let p = std::path::Path::new(r);
-            p.is_dir() && db::open(&p.join("library.db")).is_ok()
-        })
+        .map(|r| check_library_ok_timed(r, std::time::Duration::from_millis(2500)))
         .unwrap_or(false);
 
     SetupState {
@@ -243,7 +290,48 @@ pub fn get_setup_state() -> SetupState {
         browser_cookies: c.browser_cookies.unwrap_or_default(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         library_ok,
+        hide_nsfw: c.hide_nsfw.unwrap_or(false),
+        video_gif: c.video_gif.unwrap_or(false),
+        video_gif_secs: c.video_gif_secs.unwrap_or(5),
+        video_gif_replace: c.video_gif_replace.unwrap_or(false),
+        video_gif_fps: c.video_gif_fps.unwrap_or(15),
+        video_gif_width: c.video_gif_width.unwrap_or(480),
+        use_trash: c.use_trash.unwrap_or(true), // по умолчанию — безопасно, через корзину
+        trash_days: c.trash_days.unwrap_or(30),
     }
+}
+
+/// Краткая инфо о файлах по id — для контекст-меню там, где под рукой только
+/// id (модалки «Дубликаты» и «Предложить группы»). Для inplace-файлов в
+/// rel_path лежит абсолютный путь, root.join(abs) = abs, так что join безопасен.
+#[tauri::command]
+pub fn files_brief(state: State<AppState>, ids: Vec<i64>) -> Result<Vec<serde_json::Value>, String> {
+    let root = get_root(&state)?;
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    let mut out = Vec::new();
+    for id in ids {
+        let row = conn.query_row(
+            "SELECT kind, rel_path, thumb_rel FROM files WHERE id = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        );
+        if let Ok((kind, rel, thumb)) = row {
+            out.push(serde_json::json!({
+                "id": id,
+                "kind": kind,
+                "path": root.join(&rel).to_string_lossy().into_owned(),
+                "thumb": thumb.map(|t| root.join(t).to_string_lossy().into_owned()),
+            }));
+        }
+    }
+    Ok(out)
 }
 
 // ---------- Экспорт / импорт библиотеки (zip) ----------
@@ -563,14 +651,19 @@ pub fn lan_qr() -> Result<serde_json::Value, String> {
     let url = format!("http://{ip}:{port}");
     // Прямая ссылка: скан камерой открывает мобильную страницу, токен сохранится сам.
     let payload = format!("{url}/?token={token}");
-    let code = qrcode::QrCode::new(payload.as_bytes()).map_err(|e| e.to_string())?;
-    let svg = code
+    let svg = qr_svg(&payload)?;
+    Ok(serde_json::json!({ "svg": svg, "url": url }))
+}
+
+/// QR-код (SVG) для произвольного текста — в стиле приложения.
+fn qr_svg(text: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(code
         .render::<qrcode::render::svg::Color>()
         .min_dimensions(220, 220)
         .dark_color(qrcode::render::svg::Color("#1a1a22"))
         .light_color(qrcode::render::svg::Color("#ffffff"))
-        .build();
-    Ok(serde_json::json!({ "svg": svg, "url": url }))
+        .build())
 }
 
 /// Локальный IP: узнаём адрес исходящего интерфейса (пакеты никуда не шлются).
@@ -580,11 +673,292 @@ fn local_ip() -> Option<String> {
     Some(s.local_addr().ok()?.ip().to_string())
 }
 
+// ---------- Доступ через Tailscale (доверенный HTTPS для офлайн-PWA) ----------
+// Tailscale даёт настоящий Let's Encrypt сертификат на имя <устройство>.<tailnet>.ts.net
+// и проксирует https → наш локальный http. Это защищённый контекст → в PWA
+// начинает работать Service Worker → приложение открывается офлайн. Плюс доступ
+// работает и вне дома (LTE), а не только по домашней сети.
+
+/// Имя интерпретатора по умолчанию: в Windows — `python`, в Linux/macOS —
+/// `python3` (в Ubuntu команды `python` обычно нет вовсе).
+pub fn default_python() -> &'static str {
+    if cfg!(windows) { "python" } else { "python3" }
+}
+
+/// Прячем консольное окно дочернего процесса (иначе в windowed-сборке мигает cmd).
+#[cfg(windows)]
+fn no_console(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn no_console(_cmd: &mut std::process::Command) {}
+
+/// Запустить tailscale-команду с жёстким таймаутом: процесс — в отдельном потоке,
+/// не ответил за `secs` → ошибка. Иначе зависший CLI повесил бы вызов
+/// (а раньше это ещё и морозило UI — команды были синхронными).
+fn ts_run(exe: &std::path::Path, args: &[&str], secs: u64) -> Result<std::process::Output, String> {
+    let exe = exe.to_path_buf();
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut c = std::process::Command::new(&exe);
+        no_console(&mut c);
+        let _ = tx.send(c.args(&owned).output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(Ok(o)) => Ok(o),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("Tailscale не ответил вовремя (проверь, что он установлен и вы вошли в аккаунт).".into()),
+    }
+}
+
+/// Путь к CLI tailscale: стандартная папка установки на Windows или PATH.
+fn tailscale_exe() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        for p in [
+            r"C:\Program Files\Tailscale\tailscale.exe",
+            r"C:\Program Files (x86)\Tailscale\tailscale.exe",
+        ] {
+            let pb = PathBuf::from(p);
+            if pb.exists() {
+                return Some(pb);
+            }
+        }
+    }
+    let pb = PathBuf::from("tailscale");
+    if ts_run(&pb, &["version"], 5).map(|o| o.status.success()).unwrap_or(false) {
+        return Some(pb);
+    }
+    None
+}
+
+/// Состояние Tailscale (блокирующая часть; вызывается через spawn_blocking).
+fn ts_status_inner() -> serde_json::Value {
+    let Some(exe) = tailscale_exe() else {
+        return serde_json::json!({ "installed": false });
+    };
+    match ts_run(&exe, &["status", "--json"], 8) {
+        Ok(o) if o.status.success() => {
+            let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+            let state = v.get("BackendState").and_then(|s| s.as_str()).unwrap_or("");
+            let dns = v
+                .get("Self")
+                .and_then(|s| s.get("DNSName"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .trim_end_matches('.')
+                .to_string();
+            serde_json::json!({
+                "installed": true,
+                "running": state == "Running",
+                "state": state,
+                "dns_name": dns
+            })
+        }
+        Ok(o) => serde_json::json!({
+            "installed": true, "running": false,
+            "error": String::from_utf8_lossy(&o.stderr).to_string()
+        }),
+        Err(e) => serde_json::json!({ "installed": true, "running": false, "error": e }),
+    }
+}
+
+/// Состояние Tailscale: установлен ли, запущен ли, MagicDNS-имя устройства.
+#[tauri::command]
+pub async fn ts_status() -> serde_json::Value {
+    tauri::async_runtime::spawn_blocking(ts_status_inner)
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "installed": false }))
+}
+
+/// Уже ли настроен serve на наш порт (тогда не нужно снова просить админа).
+/// `tailscale serve status` — чтение, работает без прав.
+fn serve_already_on(exe: &std::path::Path, port: u16) -> bool {
+    match ts_run(exe, &["serve", "status"], 5) {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.contains("https://") && s.contains(&format!("127.0.0.1:{port}"))
+        }
+        _ => false,
+    }
+}
+
+/// Запуск `tailscale serve` с правами администратора.
+/// На Windows serve пишет конфигурацию через LocalAPI, а это админский
+/// именованный канал (\\.\pipe\ProtectedPrefix\Administrators\Tailscale\…):
+/// неэлевированный вызов не ошибается, а виснет. Поэтому поднимаем через UAC.
+#[cfg(windows)]
+fn run_serve_enable(exe: &std::path::Path, target: &str) -> Result<(), String> {
+    // ВАЖНО: launch-and-don't-wait. С `-Wait -PassThru -Verb RunAs` PowerShell
+    // виснет, ожидая элевированный процесс через границу UAC (сам serve при этом
+    // может не завершаться). Поэтому просто запускаем элевированно и возвращаемся
+    // сразу после подтверждения UAC; успех проверим отдельно чтением serve status.
+    let ps = format!(
+        "try {{ Start-Process -FilePath '{}' -ArgumentList \
+         @('serve','--bg','--yes','--https=443','{}') -Verb RunAs -WindowStyle Hidden; exit 0 }} \
+         catch {{ exit 999 }}",
+        exe.display(),
+        target
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut c = std::process::Command::new("powershell");
+        no_console(&mut c);
+        let _ = tx.send(
+            c.args(["-NoProfile", "-NonInteractive", "-Command", ps.as_str()])
+                .output(),
+        );
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(90)) {
+        Ok(Ok(o)) if o.status.success() => Ok(()),
+        Ok(Ok(o)) if o.status.code() == Some(999) => {
+            Err("Запрос прав администратора отклонён. Нажми «Да» в окне Windows и повтори.".into())
+        }
+        Ok(Ok(_)) => Err(
+            "Не удалось запустить Tailscale с правами администратора. Повтори или запусти менеджер от администратора."
+                .into(),
+        ),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("Windows не ответил на запрос прав вовремя. Повтори.".into()),
+    }
+}
+#[cfg(not(windows))]
+fn run_serve_enable(exe: &std::path::Path, target: &str) -> Result<(), String> {
+    let out = ts_run(exe, &["serve", "--bg", "--yes", "--https=443", target], 30)?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // В Linux tailscale по умолчанию слушается только root: без разрешения
+        // «оператора» команда падает с access denied.
+        let hint = if err.contains("permission")
+            || err.contains("access denied")
+            || err.contains("Access denied")
+        {
+            "\n\nВ Linux разреши своему пользователю управлять Tailscale:\n\
+             sudo tailscale set --operator=$USER\n\
+             (одна команда, один раз) — и повтори."
+        } else {
+            ""
+        };
+        return Err(format!("Не удалось включить: {err}{hint}"));
+    }
+    Ok(())
+}
+
+fn ts_serve_enable_inner() -> Result<serde_json::Value, String> {
+    let exe = tailscale_exe()
+        .ok_or("Tailscale не найден. Установи Tailscale, войди в аккаунт и повтори.")?;
+    let cfg = load_config();
+    let port = cfg.http_port.unwrap_or(7877);
+    let token = cfg.http_token.unwrap_or_default();
+    let target = format!("http://127.0.0.1:{port}");
+    // Уже включено (с прошлого раза serve --bg переживает перезапуски) — не
+    // дёргаем UAC повторно, просто показываем адрес.
+    if !serve_already_on(&exe, port) {
+        run_serve_enable(&exe, &target)?;
+        // Элевированный запуск не ждём — даём tailscaled записать конфиг и
+        // подтверждаем чтением serve status (обычно 1–2с, подстраховка до ~5).
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            if serve_already_on(&exe, port) {
+                break;
+            }
+        }
+    }
+    let st = ts_status_inner();
+    let dns = st.get("dns_name").and_then(|s| s.as_str()).unwrap_or("");
+    if dns.is_empty() {
+        return Err("Tailscale включён, но адрес устройства не получен — войди в аккаунт Tailscale.".into());
+    }
+    let url = format!("https://{dns}/");
+    let svg = qr_svg(&format!("{url}?token={token}"))?;
+    Ok(serde_json::json!({ "url": url, "svg": svg }))
+}
+
+/// Включить доступ: tailscale serve проксирует https://<magicdns>/ → локальный http.
+#[tauri::command]
+pub async fn ts_serve_enable() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(ts_serve_enable_inner)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn ts_serve_disable_inner() -> Result<(), String> {
+    let exe = tailscale_exe().ok_or("Tailscale не найден")?;
+    let out = ts_run(&exe, &["serve", "reset"], 15)?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+/// Выключить доступ (сбросить конфигурацию tailscale serve).
+#[tauri::command]
+pub async fn ts_serve_disable() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(ts_serve_disable_inner)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Прячем внутренние папки библиотеки (store/thumbs) от Проводника и поиска
+/// Windows: атрибуты «скрытый» + «не индексировать содержимое». Так арты (в т.ч.
+/// NSFW) не всплывают в «Недавних»/поиске/таймлайне. Менеджер читает файлы по
+/// путям — атрибуты ему не мешают. Уровень ОС: полной гарантии нет, но основные
+/// утечки убирает.
+#[cfg(windows)]
+fn hide_from_explorer(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN,
+        FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let cur = GetFileAttributesW(wide.as_ptr());
+        if cur == u32::MAX {
+            return; // INVALID_FILE_ATTRIBUTES — папки ещё нет
+        }
+        let _ = SetFileAttributesW(
+            wide.as_ptr(),
+            cur | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+        );
+    }
+}
+#[cfg(not(windows))]
+fn hide_from_explorer(_path: &std::path::Path) {}
+
+/// Пометить внутренние папки библиотеки скрытыми/неиндексируемыми (приватность).
+/// Windows — атрибуты файла; Linux — файл `.hidden` (его читают Nautilus/Files
+/// и прочие GTK-менеджеры) плюс `.nomedia`, чтобы галереи не подхватывали арты.
+pub fn harden_library(root: &std::path::Path) {
+    hide_from_explorer(&root.join("store"));
+    hide_from_explorer(&root.join("thumbs"));
+    hide_from_explorer(&root.join("trash"));
+
+    #[cfg(not(windows))]
+    {
+        let _ = std::fs::write(root.join(".hidden"), "store\nthumbs\ntrash\n");
+        for d in ["store", "thumbs", "trash"] {
+            let dir = root.join(d);
+            if dir.is_dir() {
+                let _ = std::fs::write(dir.join(".nomedia"), b"");
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub fn setup_library(state: State<AppState>, path: String, mode: String) -> Result<(), String> {
     let root = PathBuf::from(&path);
     std::fs::create_dir_all(root.join("store")).map_err(|e| format!("Не удалось создать папку: {e}"))?;
     std::fs::create_dir_all(root.join("thumbs")).map_err(|e| e.to_string())?;
+    harden_library(&root); // скрыть от Проводника/поиска Windows
 
     let conn = db::open(&root.join("library.db")).map_err(|e| format!("Не удалось открыть базу: {e}"))?;
     *state.conn.lock().unwrap() = Some(conn);
@@ -790,14 +1164,17 @@ pub(crate) fn build_filters(search: &str) -> SearchFilters {
 }
 
 /// SQL-условие «файл NSFW?»: ручная пометка или rating-тег от ИИ.
+/// SQL-выражение эффективного рейтинга файла (0/1) для алиаса `f`: явный
+/// f.nsfw, иначе по rating-тегам (explicit/questionable = NSFW).
+pub(crate) fn nsfw_expr() -> &'static str {
+    "COALESCE(f.nsfw, (CASE WHEN EXISTS (SELECT 1 FROM file_tags ftn \
+     JOIN tags tgn ON tgn.id = ftn.tag_id WHERE ftn.file_id = f.id \
+     AND tgn.namespace = 'rating' AND tgn.name IN ('explicit','questionable')) \
+     THEN 1 ELSE 0 END))"
+}
+
 pub(crate) fn nsfw_clause(want: i64) -> String {
-    format!(
-        " AND COALESCE(f.nsfw, (CASE WHEN EXISTS (SELECT 1 FROM file_tags ftn \
-         JOIN tags tgn ON tgn.id = ftn.tag_id WHERE ftn.file_id = f.id \
-         AND tgn.namespace = 'rating' AND tgn.name IN ('explicit','questionable')) \
-         THEN 1 ELSE 0 END)) = {}",
-        want.clamp(0, 1)
-    )
+    format!(" AND {} = {}", nsfw_expr(), want.clamp(0, 1))
 }
 
 // ---------- Массовое редактирование тегов ----------
@@ -1158,6 +1535,7 @@ pub fn count_files(
     collection: Option<i64>,
     nsfw: Option<i64>,
     recent: Option<bool>,
+    favorite: Option<bool>,
 ) -> Result<i64, String> {
     let guard = state.conn.lock().unwrap();
     let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
@@ -1165,8 +1543,13 @@ pub fn count_files(
     if recent.unwrap_or(false) {
         where_sql.push_str(" AND f.viewed_at IS NOT NULL");
     }
+    if favorite.unwrap_or(false) {
+        where_sql.push_str(" AND COALESCE(f.favorite, 0) = 1");
+    }
+    // GROUP_COVER_WHERE — как в query_files: считаем стопки, а не страницы групп,
+    // иначе счётчик «в текущем виде» не совпадает с тем, что показывает галерея.
     conn.query_row(
-        &format!("SELECT COUNT(*) FROM files f WHERE 1=1{where_sql}"),
+        &format!("SELECT COUNT(*) FROM files f WHERE 1=1{where_sql}{GROUP_COVER_WHERE}"),
         params_from_iter(binds.iter()),
         |r| r.get(0),
     )
@@ -1185,14 +1568,16 @@ pub fn library_health(state: State<AppState>) -> Result<serde_json::Value, Strin
     };
 
     let files = one("SELECT COUNT(*) FROM files");
-    let untagged = one(
+    // untagged/uncollected — жмякаемы («показать» → галерея): считаем стопки, а не
+    // страницы групп (GROUP_COVER_WHERE), иначе счётчик и выдача не совпадают.
+    let untagged = one(&format!(
         "SELECT COUNT(*) FROM files f WHERE NOT EXISTS \
-         (SELECT 1 FROM file_tags ft WHERE ft.file_id = f.id)",
-    );
-    let uncollected = one(
+         (SELECT 1 FROM file_tags ft WHERE ft.file_id = f.id){GROUP_COVER_WHERE}"
+    ));
+    let uncollected = one(&format!(
         "SELECT COUNT(*) FROM files f WHERE NOT EXISTS \
-         (SELECT 1 FROM collection_files cf WHERE cf.file_id = f.id)",
-    );
+         (SELECT 1 FROM collection_files cf WHERE cf.file_id = f.id){GROUP_COVER_WHERE}"
+    ));
     let unindexed = conn
         .query_row(
             &format!(
@@ -1306,6 +1691,9 @@ pub fn query_files(
     collection: Option<i64>,
     nsfw: Option<i64>,
     recent: Option<bool>,
+    favorite: Option<bool>,
+    sort: Option<String>,
+    seed: Option<i64>,
 ) -> Result<Vec<FileCard>, String> {
     let root = get_root(&state)?;
     let guard = state.conn.lock().unwrap();
@@ -1316,14 +1704,29 @@ pub fn query_files(
     if recent {
         where_sql.push_str(" AND f.viewed_at IS NOT NULL");
     }
+    if favorite.unwrap_or(false) {
+        where_sql.push_str(" AND COALESCE(f.favorite, 0) = 1");
+    }
     // В галерее группа выглядит одной «стопкой»: показываем только обложку.
     let mut sql =
         format!("SELECT {CARD_COLS} FROM files f WHERE 1=1{where_sql}{GROUP_COVER_WHERE}");
 
-    let order = if recent {
-        "f.viewed_at DESC, f.id DESC" // история просмотров — по свежести просмотра
-    } else {
-        "f.imported_at DESC, f.id DESC"
+    // Сортировка: по умолчанию новые сверху; «недавние» — по времени просмотра.
+    // «Случайно» — НЕ RANDOM(): он перемешивает при каждом запросе, из-за чего
+    // ломается постраничная подгрузка (дубли/пропуски) и выдача «прыгает» после
+    // любого действия. Вместо этого детерминированная смесь id с зерном: пока
+    // зерно то же — порядок стабилен, новое зерно = новое перемешивание.
+    let order: String = match sort.as_deref().unwrap_or("") {
+        "old" => "f.imported_at ASC, f.id ASC".into(),
+        "big" => "f.size DESC, f.id DESC".into(),
+        "small" => "f.size ASC, f.id ASC".into(),
+        "views" => "COALESCE(f.view_count, 0) DESC, f.id DESC".into(),
+        "random" => {
+            let s = seed.unwrap_or(1).abs().max(1);
+            format!("((f.id * 1103515245 + {s}) % 2147483647), f.id")
+        }
+        _ if recent => "f.viewed_at DESC, f.id DESC".into(), // история просмотров
+        _ => "f.imported_at DESC, f.id DESC".into(),
     };
     sql.push_str(&format!(
         " ORDER BY {order} LIMIT {} OFFSET {}",
@@ -1380,7 +1783,7 @@ pub fn file_details(state: State<AppState>, id: i64) -> Result<FileDetails, Stri
     let (card, sha256) = conn
         .query_row(&sql, [id], |row| {
             let card = card_from_row(&root, row)?;
-            let sha: String = row.get(13)?; // после group-колонок (8–12)
+            let sha: String = row.get(14)?; // после group-колонок (8–12) и favorite (13)
             Ok((card, sha))
         })
         .map_err(|_| "Файл не найден".to_string())?;
@@ -1693,17 +2096,138 @@ pub fn save_video_thumb(
 
 // ---------- Удаление ----------
 
-fn delete_one(conn: &Connection, root: &Path, file_id: i64) -> Result<(), String> {
-    let (rel, thumb, storage, sha): (String, Option<String>, Option<String>, String) = conn
+/// Собирает метаданные арта (теги, коллекции, источники, рейтинг, избранное),
+/// чтобы восстановление из корзины вернуло арт «как было».
+fn collect_meta(conn: &Connection, file_id: i64) -> serde_json::Value {
+    let tags: Vec<serde_json::Value> = conn
+        .prepare(
+            "SELECT t.namespace, t.name, ft.origin FROM file_tags ft \
+             JOIN tags t ON t.id = ft.tag_id WHERE ft.file_id = ?1",
+        )
+        .and_then(|mut s| {
+            let v = s
+                .query_map([file_id], |r| {
+                    Ok(serde_json::json!({
+                        "ns": r.get::<_, String>(0)?,
+                        "name": r.get::<_, String>(1)?,
+                        "origin": r.get::<_, String>(2)?
+                    }))
+                })?
+                .flatten()
+                .collect::<Vec<_>>();
+            Ok(v)
+        })
+        .unwrap_or_default();
+    let cols: Vec<String> = conn
+        .prepare(
+            "SELECT c.name FROM collection_files cf JOIN collections c ON c.id = cf.collection_id \
+             WHERE cf.file_id = ?1",
+        )
+        .and_then(|mut s| {
+            let v = s
+                .query_map([file_id], |r| r.get::<_, String>(0))?
+                .flatten()
+                .collect::<Vec<_>>();
+            Ok(v)
+        })
+        .unwrap_or_default();
+    let sources: Vec<serde_json::Value> = conn
+        .prepare("SELECT url, site, artist, title FROM sources WHERE file_id = ?1")
+        .and_then(|mut s| {
+            let v = s
+                .query_map([file_id], |r| {
+                    Ok(serde_json::json!({
+                        "url": r.get::<_, Option<String>>(0)?,
+                        "site": r.get::<_, Option<String>>(1)?,
+                        "artist": r.get::<_, Option<String>>(2)?,
+                        "title": r.get::<_, Option<String>>(3)?
+                    }))
+                })?
+                .flatten()
+                .collect::<Vec<_>>();
+            Ok(v)
+        })
+        .unwrap_or_default();
+    let (nsfw, fav): (Option<i64>, Option<i64>) = conn
+        .query_row("SELECT nsfw, favorite FROM files WHERE id = ?1", [file_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap_or((None, None));
+    serde_json::json!({ "tags": tags, "collections": cols, "sources": sources,
+                        "nsfw": nsfw, "favorite": fav.unwrap_or(0) })
+}
+
+/// Удаление = перенос в корзину: файл переезжает в <библиотека>/trash/,
+/// метаданные сохраняются, запись из files убирается (поэтому арт сразу
+/// исчезает из галереи, поиска, дубликатов и мобильной страницы).
+fn delete_one(conn: &Connection, root: &Path, file_id: i64, use_trash: bool) -> Result<(), String> {
+    let (rel, thumb, storage, sha, ext, kind): (
+        String, Option<String>, Option<String>, String, String, String,
+    ) = conn
         .query_row(
-            "SELECT rel_path, thumb_rel, storage, sha256 FROM files WHERE id = ?1",
+            "SELECT rel_path, thumb_rel, storage, sha256, ext, kind FROM files WHERE id = ?1",
             [file_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .map_err(|_| "Файл не найден".to_string())?;
 
+    let inplace = storage.as_deref() == Some("inplace");
+
+    // Корзина выключена в настройках — удаляем сразу и безвозвратно (как раньше).
+    if !use_trash {
+        conn.execute("DELETE FROM files WHERE id = ?1", [file_id])
+            .map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO deleted_hashes (sha256, deleted_at) VALUES (?1, ?2)",
+            params![sha, unix_now()],
+        );
+        if !inplace {
+            let _ = std::fs::remove_file(root.join(&rel));
+        }
+        if let Some(t) = thumb {
+            let _ = std::fs::remove_file(root.join(t));
+        }
+        return Ok(());
+    }
+
+    let meta = collect_meta(conn, file_id);
+
+    // Копия из store переезжает в корзину; оригинал in-place не трогаем.
+    let mut trash_rel: Option<String> = None;
+    if !inplace {
+        let dir = root.join("trash");
+        let _ = std::fs::create_dir_all(&dir);
+        let name = format!("{sha}.{ext}");
+        let dst = dir.join(&name);
+        let src = root.join(&rel);
+        if std::fs::rename(&src, &dst).is_err() {
+            // rename может не сработать между разными томами — пробуем копию
+            if std::fs::copy(&src, &dst).is_ok() {
+                let _ = std::fs::remove_file(&src);
+            }
+        }
+        if dst.exists() {
+            trash_rel = Some(format!("trash/{name}"));
+        }
+    }
+
     conn.execute("DELETE FROM files WHERE id = ?1", [file_id])
         .map_err(|e| e.to_string())?;
+
+    let _ = conn.execute(
+        "INSERT INTO trash (sha256, ext, kind, trash_rel, orig_rel, storage, meta, deleted_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            sha,
+            ext,
+            kind,
+            trash_rel,
+            rel,
+            if inplace { "inplace" } else { "store" },
+            meta.to_string(),
+            unix_now()
+        ],
+    );
 
     // «Надгробие»: watcher не должен возвращать удалённое из отслеживаемых папок.
     let _ = conn.execute(
@@ -1711,10 +2235,7 @@ fn delete_one(conn: &Connection, root: &Path, file_id: i64) -> Result<(), String
         params![sha, unix_now()],
     );
 
-    // Оригинал in-place НЕ трогаем — убираем только копию из store.
-    if storage.as_deref() != Some("inplace") {
-        let _ = std::fs::remove_file(root.join(rel));
-    }
+    // Превью удаляем — при восстановлении оно создастся заново.
     if let Some(t) = thumb {
         let _ = std::fs::remove_file(root.join(t));
     }
@@ -1726,9 +2247,10 @@ fn delete_one(conn: &Connection, root: &Path, file_id: i64) -> Result<(), String
 #[tauri::command]
 pub fn delete_file(state: State<AppState>, file_id: i64) -> Result<(), String> {
     let root = get_root(&state)?;
+    let use_trash = load_config().use_trash.unwrap_or(true);
     let guard = state.conn.lock().unwrap();
     let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
-    delete_one(conn, &root, file_id)
+    delete_one(conn, &root, file_id, use_trash)
 }
 
 /// Удаление нескольких файлов (мультивыбор).
@@ -1741,6 +2263,7 @@ pub fn delete_files(
     expand_groups: Option<bool>,
 ) -> Result<(), String> {
     let root = get_root(&state)?;
+    let use_trash = load_config().use_trash.unwrap_or(true);
     let guard = state.conn.lock().unwrap();
     let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
     let expand = expand_groups.unwrap_or(false);
@@ -1777,7 +2300,7 @@ pub fn delete_files(
     }
 
     for fid in all {
-        delete_one(conn, &root, fid)?;
+        delete_one(conn, &root, fid, use_trash)?;
     }
     // Осиротевшие группы (все страницы удалены) подчищаем
     let _ = conn.execute(
@@ -1786,6 +2309,258 @@ pub fn delete_files(
         [],
     );
     Ok(())
+}
+
+/// Пометить/снять «избранное» (★) у артов.
+#[tauri::command]
+pub fn set_favorite(state: State<AppState>, file_ids: Vec<i64>, on: bool) -> Result<(), String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    for id in file_ids {
+        let _ = conn.execute(
+            "UPDATE files SET favorite = ?1 WHERE id = ?2",
+            params![if on { 1 } else { 0 }, id],
+        );
+    }
+    Ok(())
+}
+
+// ---------- Корзина ----------
+
+/// Что лежит в корзине (свежие сверху).
+#[tauri::command]
+pub fn trash_list(state: State<AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let root = get_root(&state)?;
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, sha256, ext, kind, trash_rel, orig_rel, storage, meta, deleted_at \
+             FROM trash ORDER BY deleted_at DESC, id DESC LIMIT 500",
+        )
+        .map_err(|e| e.to_string())?;
+    let out: Vec<serde_json::Value> = stmt
+        .query_map([], |r| {
+            let trash_rel: Option<String> = r.get(4)?;
+            let orig_rel: String = r.get(5)?;
+            let storage: String = r.get(6)?;
+            let meta: String = r.get(7)?;
+            // Превью: для store — сам файл в корзине, для in-place — оригинал
+            let prev = match (&trash_rel, storage.as_str()) {
+                (Some(t), _) => Some(root.join(t).to_string_lossy().into_owned()),
+                (None, "inplace") => Some(root.join(&orig_rel).to_string_lossy().into_owned()),
+                _ => None,
+            };
+            let name = std::path::Path::new(&orig_rel)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Ok(serde_json::json!({
+                "id": r.get::<_, i64>(0)?,
+                "sha256": r.get::<_, String>(1)?,
+                "ext": r.get::<_, String>(2)?,
+                "kind": r.get::<_, String>(3)?,
+                "preview": prev,
+                "name": name,
+                "storage": storage,
+                "deleted_at": r.get::<_, i64>(8)?,
+                "meta": serde_json::from_str::<serde_json::Value>(&meta)
+                    .unwrap_or(serde_json::Value::Null),
+            }))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn trash_count(state: State<AppState>) -> Result<i64, String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    conn.query_row("SELECT COUNT(*) FROM trash", [], |r| r.get(0))
+        .map_err(|e| e.to_string())
+}
+
+/// Вернуть арты из корзины в библиотеку (с тегами, коллекциями, источниками).
+#[tauri::command]
+pub fn trash_restore(state: State<AppState>, ids: Vec<i64>) -> Result<i64, String> {
+    let root = get_root(&state)?;
+    let lossless = load_config().lossless.unwrap_or(false);
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    let mut done = 0i64;
+    for tid in ids {
+        let row: Result<(String, Option<String>, String, String, String), _> = conn.query_row(
+            "SELECT sha256, trash_rel, orig_rel, storage, meta FROM trash WHERE id = ?1",
+            [tid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        );
+        let Ok((sha, trash_rel, orig_rel, storage, meta_s)) = row else { continue };
+        let inplace = storage == "inplace";
+        let src = match (&trash_rel, inplace) {
+            (Some(t), _) => root.join(t),
+            (None, true) => root.join(&orig_rel), // для in-place это абсолютный путь
+            _ => continue,
+        };
+        if !src.exists() {
+            continue; // файл унесли мимо приложения — пропускаем
+        }
+        // Снимаем «надгробие», иначе импорт посчитает арт удалённым
+        let _ = conn.execute("DELETE FROM deleted_hashes WHERE sha256 = ?1", [&sha]);
+        let Ok((fid, _)) = import::import_one(conn, &root, &src, inplace, lossless, false) else {
+            continue;
+        };
+        // Возвращаем метаданные
+        let meta: serde_json::Value = serde_json::from_str(&meta_s).unwrap_or(serde_json::Value::Null);
+        if let Some(tags) = meta.get("tags").and_then(|v| v.as_array()) {
+            for t in tags {
+                let ns = t.get("ns").and_then(|v| v.as_str()).unwrap_or("");
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let origin = t.get("origin").and_then(|v| v.as_str()).unwrap_or("manual");
+                if name.is_empty() {
+                    continue;
+                }
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO tags (namespace, name) VALUES (?1, ?2)",
+                    params![ns, name],
+                );
+                if let Ok(tag_id) = conn.query_row(
+                    "SELECT id FROM tags WHERE namespace = ?1 AND name = ?2",
+                    params![ns, name],
+                    |r| r.get::<_, i64>(0),
+                ) {
+                    let _ = conn.execute(
+                        "INSERT OR IGNORE INTO file_tags (file_id, tag_id, origin) VALUES (?1, ?2, ?3)",
+                        params![fid, tag_id, origin],
+                    );
+                }
+            }
+        }
+        if let Some(cols) = meta.get("collections").and_then(|v| v.as_array()) {
+            for c in cols {
+                let Some(nm) = c.as_str() else { continue };
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO collections (name, created_at) VALUES (?1, ?2)",
+                    params![nm, unix_now()],
+                );
+                if let Ok(cid) = conn.query_row(
+                    "SELECT id FROM collections WHERE name = ?1",
+                    params![nm],
+                    |r| r.get::<_, i64>(0),
+                ) {
+                    let _ = conn.execute(
+                        "INSERT OR IGNORE INTO collection_files (collection_id, file_id, added_at) \
+                         VALUES (?1, ?2, ?3)",
+                        params![cid, fid, unix_now()],
+                    );
+                }
+            }
+        }
+        if let Some(srcs) = meta.get("sources").and_then(|v| v.as_array()) {
+            for s in srcs {
+                let _ = conn.execute(
+                    "INSERT INTO sources (file_id, url, site, artist, title) VALUES (?1,?2,?3,?4,?5)",
+                    params![
+                        fid,
+                        s.get("url").and_then(|v| v.as_str()),
+                        s.get("site").and_then(|v| v.as_str()),
+                        s.get("artist").and_then(|v| v.as_str()),
+                        s.get("title").and_then(|v| v.as_str())
+                    ],
+                );
+            }
+        }
+        let nsfw = meta.get("nsfw").and_then(|v| v.as_i64());
+        let fav = meta.get("favorite").and_then(|v| v.as_i64()).unwrap_or(0);
+        let _ = conn.execute(
+            "UPDATE files SET nsfw = ?1, favorite = ?2 WHERE id = ?3",
+            params![nsfw, fav, fid],
+        );
+        // Файл вернулся в store — копию из корзины убираем
+        if let Some(t) = &trash_rel {
+            let _ = std::fs::remove_file(root.join(t));
+        }
+        let _ = conn.execute("DELETE FROM trash WHERE id = ?1", [tid]);
+        done += 1;
+    }
+    Ok(done)
+}
+
+/// Окончательно удалить из корзины (ids пуст — очистить всю).
+#[tauri::command]
+pub fn trash_purge(state: State<AppState>, ids: Vec<i64>) -> Result<i64, String> {
+    let root = get_root(&state)?;
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    let rows: Vec<(i64, Option<String>)> = if ids.is_empty() {
+        let mut s = conn
+            .prepare("SELECT id, trash_rel FROM trash")
+            .map_err(|e| e.to_string())?;
+        let v = s
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect::<Vec<(i64, Option<String>)>>();
+        v
+    } else {
+        let mut v = Vec::new();
+        for id in &ids {
+            if let Ok(t) = conn.query_row(
+                "SELECT id, trash_rel FROM trash WHERE id = ?1",
+                [id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+            ) {
+                v.push(t);
+            }
+        }
+        v
+    };
+    let mut n = 0i64;
+    for (id, trash_rel) in rows {
+        if let Some(t) = trash_rel {
+            let _ = std::fs::remove_file(root.join(t));
+        }
+        let _ = conn.execute("DELETE FROM trash WHERE id = ?1", [id]);
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Настройки корзины (применяются сразу).
+#[tauri::command]
+pub fn set_trash_settings(use_trash: bool, days: i64) -> Result<(), String> {
+    let mut c = load_config();
+    c.use_trash = Some(use_trash);
+    c.trash_days = Some(days.clamp(0, 365)); // 0 = не чистить автоматически
+    save_config(&c)
+}
+
+/// Автоочистка корзины: всё старше `days` дней удаляется безвозвратно.
+/// Сравниваем сохранённую дату удаления с текущей, поэтому «просроченное»
+/// подчищается и после долгого простоя — приложение не обязано быть запущено.
+/// days = 0 — автоочистка выключена.
+pub fn trash_purge_old(root: &Path, days: i64) {
+    if days <= 0 {
+        return;
+    }
+    let Ok(conn) = db::open(&root.join("library.db")) else { return };
+    let cutoff = unix_now() - days * 86400;
+    let Ok(mut stmt) = conn.prepare("SELECT id, trash_rel FROM trash WHERE deleted_at < ?1") else {
+        return;
+    };
+    let rows: Vec<(i64, Option<String>)> = stmt
+        .query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default();
+    for (id, trash_rel) in rows {
+        if let Some(t) = trash_rel {
+            let _ = std::fs::remove_file(root.join(t));
+        }
+        let _ = conn.execute("DELETE FROM trash WHERE id = ?1", [id]);
+    }
 }
 
 /// Добавить несколько файлов в коллекцию (мультивыбор, без переключения).
@@ -1814,6 +2589,8 @@ pub struct CollectionOut {
     pub id: i64,
     pub name: String,
     pub count: i64,
+    pub nsfw: Option<i64>, // явная пометка: 0=SFW, 1=NSFW, None=авто
+    pub is_nsfw: bool,     // эффективно NSFW (для режима скрытия)
 }
 
 fn unix_now() -> i64 {
@@ -1827,25 +2604,52 @@ fn unix_now() -> i64 {
 pub fn list_collections(state: State<AppState>) -> Result<Vec<CollectionOut>, String> {
     let guard = state.conn.lock().unwrap();
     let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.id, c.name, COUNT(cf.file_id) FROM collections c \
-             LEFT JOIN collection_files cf ON cf.collection_id = c.id \
-             GROUP BY c.id ORDER BY COALESCE(c.position, 999999), c.name",
-        )
-        .map_err(|e| e.to_string())?;
+    // is_nsfw: явная пометка 0/1, иначе (авто) — есть ли хоть один NSFW-арт внутри.
+    let sql = format!(
+        "SELECT c.id, c.name, COUNT(cf.file_id), c.nsfw, \
+         CASE WHEN c.nsfw = 1 THEN 1 WHEN c.nsfw = 0 THEN 0 ELSE \
+           (CASE WHEN EXISTS (SELECT 1 FROM collection_files cf2 \
+              JOIN files f ON f.id = cf2.file_id \
+              WHERE cf2.collection_id = c.id AND {expr} = 1) THEN 1 ELSE 0 END) \
+         END AS is_nsfw \
+         FROM collections c LEFT JOIN collection_files cf ON cf.collection_id = c.id \
+         GROUP BY c.id ORDER BY COALESCE(c.position, 999999), c.name",
+        expr = nsfw_expr()
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let out = stmt
         .query_map([], |r| {
             Ok(CollectionOut {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 count: r.get(2)?,
+                nsfw: r.get(3)?,
+                is_nsfw: r.get::<_, i64>(4)? != 0,
             })
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     Ok(out)
+}
+
+/// Задать рейтинг коллекции: None=авто, Some(0)=SFW, Some(1)=NSFW.
+#[tauri::command]
+pub fn set_collection_nsfw(state: State<AppState>, id: i64, nsfw: Option<i64>) -> Result<(), String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    conn.execute("UPDATE collections SET nsfw = ?1 WHERE id = ?2", params![nsfw, id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Включить/выключить режим тотального скрытия NSFW (сохраняется в конфиг).
+/// ПИН-защиту на ВЫКЛючение обеспечивает фронтенд (проверяет ПИН до вызова).
+#[tauri::command]
+pub fn set_hide_nsfw(on: bool) -> Result<(), String> {
+    let mut c = load_config();
+    c.hide_nsfw = Some(on);
+    save_config(&c)
 }
 
 #[tauri::command]
@@ -2467,7 +3271,7 @@ fn sidecar_cfg() -> Result<(PathBuf, String), String> {
         return Ok((bin, String::new()));
     }
     let cfg = load_config();
-    let python = cfg.python_path.unwrap_or_else(|| "python".into());
+    let python = cfg.python_path.unwrap_or_else(|| default_python().to_string());
     let mut cands: Vec<PathBuf> = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         cands.push(cwd.join("../sidecar/main.py"));
@@ -2560,7 +3364,7 @@ fn rank_by_vector(
     let rows = stmt
         .query_map(params_from_iter(extra_binds.iter()), |row| {
             let card = card_from_row(root, row)?;
-            let blob: Vec<u8> = row.get(13)?; // после group-колонок (8–12)
+            let blob: Vec<u8> = row.get(14)?; // после group-колонок (8–12) и favorite (13)
             Ok((card, blob))
         })
         .map_err(|e| e.to_string())?;
@@ -2984,6 +3788,148 @@ pub fn list_videos_for_frames(state: State<AppState>) -> Result<Vec<serde_json::
         .flatten()
         .collect();
     Ok(out)
+}
+
+// ---------- Видео → GIF (кадры снимает фронтенд, кодирует image-crate) ----------
+
+/// Настройки конвертации видео в GIF (применяются сразу).
+#[tauri::command]
+pub fn set_gif_settings(
+    auto: bool,
+    secs: i64,
+    replace: bool,
+    fps: i64,
+    width: i64,
+) -> Result<(), String> {
+    let mut c = load_config();
+    c.video_gif = Some(auto);
+    c.video_gif_secs = Some(secs.clamp(1, 60));
+    c.video_gif_replace = Some(replace);
+    c.video_gif_fps = Some(fps.clamp(5, 30));
+    c.video_gif_width = Some(width.clamp(120, 960));
+    save_config(&c)
+}
+
+/// Видео, ещё не обработанные конвертером (длительность проверит фронтенд).
+#[tauri::command]
+pub fn list_videos_for_gif(state: State<AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let root = get_root(&state)?;
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, rel_path FROM files \
+             WHERE kind = 'video' AND gif_done IS NULL ORDER BY id LIMIT 300",
+        )
+        .map_err(|e| e.to_string())?;
+    let out: Vec<serde_json::Value> = stmt
+        .query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let rel: String = r.get(1)?;
+            Ok(serde_json::json!({ "id": id, "path": root.join(rel).to_string_lossy() }))
+        })
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    Ok(out)
+}
+
+/// Пометить видео обработанным (сконвертировано либо пропущено как длинное).
+#[tauri::command]
+pub fn mark_gif_done(state: State<AppState>, file_id: i64) -> Result<(), String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    conn.execute("UPDATE files SET gif_done = 1 WHERE id = ?1", [file_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Сбросить отметку — чтобы переконвертировать видео заново (новые настройки).
+#[tauri::command]
+pub fn reset_gif_done(state: State<AppState>) -> Result<(), String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    conn.execute("UPDATE files SET gif_done = NULL WHERE kind = 'video'", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Собрать GIF из PNG-кадров (base64), сохранить в библиотеку, пометить источник.
+/// Удаление оригинала при «заменять» делает фронтенд (delete_files) после успеха.
+#[tauri::command]
+pub async fn video_to_gif(
+    file_id: i64,
+    delay_ms: i64,
+    frames_b64: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    if frames_b64.is_empty() {
+        return Err("нет кадров".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        use base64::Engine;
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame};
+        let cfg = load_config();
+        let root = PathBuf::from(cfg.library_root.ok_or("Библиотека не настроена")?);
+        let lossless = cfg.lossless.unwrap_or(false);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("fm_gif_{ts}.gif"));
+        {
+            let f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+            let mut enc = GifEncoder::new(f);
+            enc.set_repeat(Repeat::Infinite).map_err(|e| e.to_string())?;
+            for b in &frames_b64 {
+                let png = base64::engine::general_purpose::STANDARD
+                    .decode(b.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                let img = image::load_from_memory(&png).map_err(|e| e.to_string())?.to_rgba8();
+                let delay = Delay::from_numer_denom_ms(delay_ms.clamp(2, 1000) as u32, 1);
+                enc.encode_frame(Frame::from_parts(img, 0, 0, delay))
+                    .map_err(|e| e.to_string())?;
+            }
+        } // encoder сброшен — файл дописан
+        let conn = db::open(&root.join("library.db")).map_err(|e| e.to_string())?;
+        let (gid, is_new) = import::import_one(&conn, &root, &tmp, false, lossless, false)?;
+        let _ = std::fs::remove_file(&tmp);
+        // GIF — тот же контент, что видео: наследуем теги, источник, коллекции,
+        // рейтинг и CLIP-вектор, чтобы он не оказался «без тегов» и искался.
+        if gid != file_id {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO file_tags (file_id, tag_id, origin) \
+                 SELECT ?1, tag_id, origin FROM file_tags WHERE file_id = ?2",
+                params![gid, file_id],
+            );
+            let _ = conn.execute(
+                "INSERT INTO sources (file_id, url, site, artist, title) \
+                 SELECT ?1, url, site, artist, title FROM sources WHERE file_id = ?2 \
+                 AND NOT EXISTS (SELECT 1 FROM sources s WHERE s.file_id = ?1)",
+                params![gid, file_id],
+            );
+            let now = unix_now();
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO collection_files (collection_id, file_id, added_at) \
+                 SELECT collection_id, ?1, ?2 FROM collection_files WHERE file_id = ?3",
+                params![gid, now, file_id],
+            );
+            let _ = conn.execute(
+                "UPDATE files SET nsfw = (SELECT nsfw FROM files WHERE id = ?2) WHERE id = ?1",
+                params![gid, file_id],
+            );
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO clip_vectors (file_id, embedding) \
+                 SELECT ?1, embedding FROM clip_vectors WHERE file_id = ?2",
+                params![gid, file_id],
+            );
+        }
+        let _ = conn.execute("UPDATE files SET gif_done = 1 WHERE id = ?1", [file_id]);
+        Ok(serde_json::json!({ "is_new": is_new }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Индексация видео по кадрам, снятым фронтендом (когда ffmpeg недоступен):
@@ -3730,40 +4676,71 @@ pub async fn ai_setup(app: AppHandle, ai: State<'_, AiState>) -> Result<(), Stri
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
-        let mut cmd = std::process::Command::new(&py2);
-        cmd.args(["-m", "pip", "install", "-r"])
-            .arg(&req)
-            .args(["--disable-pip-version-check", "--no-input"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
-        }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Не удалось запустить pip: {e}. Установлен ли Python?"))?;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
-        // stderr читаем в отдельном потоке, чтобы не заблокироваться
-        let app_err = app2.clone();
-        let stderr = child.stderr.take();
-        let err_thread = std::thread::spawn(move || {
-            if let Some(se) = stderr {
-                for line in BufReader::new(se).lines().flatten() {
-                    let _ = app_err.emit("ai-setup", serde_json::json!({"stage":"pip","line": line}));
+        // Запуск pip с потоковым выводом в UI. Возвращает (успех, «PEP 668»).
+        let run_pip = |extra: &[&str]| -> Result<(bool, bool), String> {
+            let mut cmd = std::process::Command::new(&py2);
+            cmd.args(["-m", "pip", "install", "-r"])
+                .arg(&req)
+                .args(["--disable-pip-version-check", "--no-input"])
+                .args(extra)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000);
+            }
+            let mut child = cmd.spawn().map_err(|e| {
+                format!(
+                    "Не удалось запустить pip: {e}. Установлен ли Python? \
+                     (Ubuntu: sudo apt install python3-pip)"
+                )
+            })?;
+
+            // stderr читаем в отдельном потоке, чтобы не заблокироваться
+            let managed = Arc::new(AtomicBool::new(false));
+            let m2 = managed.clone();
+            let app_err = app2.clone();
+            let stderr = child.stderr.take();
+            let err_thread = std::thread::spawn(move || {
+                if let Some(se) = stderr {
+                    for line in BufReader::new(se).lines().flatten() {
+                        if line.contains("externally-managed-environment") {
+                            m2.store(true, Ordering::SeqCst);
+                        }
+                        let _ = app_err
+                            .emit("ai-setup", serde_json::json!({"stage":"pip","line": line}));
+                    }
+                }
+            });
+            if let Some(out) = child.stdout.take() {
+                for line in BufReader::new(out).lines().flatten() {
+                    let _ = app2.emit("ai-setup", serde_json::json!({"stage":"pip","line": line}));
                 }
             }
-        });
-        if let Some(out) = child.stdout.take() {
-            for line in BufReader::new(out).lines().flatten() {
-                let _ = app2.emit("ai-setup", serde_json::json!({"stage":"pip","line": line}));
+            let _ = err_thread.join();
+            let status = child.wait().map_err(|e| e.to_string())?;
+            Ok((status.success(), managed.load(Ordering::SeqCst)))
+        };
+
+        let (ok, managed) = run_pip(&[])?;
+        if !ok {
+            // Ubuntu 24.04+ защищает системный Python (PEP 668) — там pip требует
+            // явного согласия. Флаг есть не во всех версиях pip, поэтому только
+            // как повтор после конкретной ошибки.
+            if managed {
+                let _ = app2.emit("ai-setup", serde_json::json!({"stage":"pip",
+                    "line":"Системный Python защищён (PEP 668) — повторяю с --break-system-packages…"}));
+                let (ok2, _) = run_pip(&["--break-system-packages"])?;
+                if !ok2 {
+                    return Err("pip завершился с ошибкой — детали выше в прогрессе".into());
+                }
+            } else {
+                return Err("pip завершился с ошибкой — детали выше в прогрессе".into());
             }
-        }
-        let _ = err_thread.join();
-        let status = child.wait().map_err(|e| e.to_string())?;
-        if !status.success() {
-            return Err("pip завершился с ошибкой — детали выше в прогрессе".into());
         }
         Ok(())
     })

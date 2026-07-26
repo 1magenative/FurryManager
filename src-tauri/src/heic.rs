@@ -108,7 +108,12 @@ fn python_candidates() -> Vec<Vec<String>> {
             v.push(vec![p]);
         }
     }
-    v.push(vec!["python".into()]);
-    v.push(vec!["py".into(), "-3".into()]);
+    // В Ubuntu есть только python3; в Windows — python и лаунчер py.
+    v.push(vec![crate::commands::default_python().to_string()]);
+    if cfg!(windows) {
+        v.push(vec!["py".into(), "-3".into()]);
+    } else {
+        v.push(vec!["python".into()]);
+    }
     v
 }

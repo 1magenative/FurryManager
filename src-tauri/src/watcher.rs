@@ -8,19 +8,20 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 /// Живой watcher хранится здесь (если уронить — слежение прекращается).
+/// Arc — чтобы подписку на папки можно было унести в фоновый поток.
 pub struct WatchState {
-    watcher: Mutex<Option<RecommendedWatcher>>,
+    watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
 }
 
 impl WatchState {
     pub fn new() -> Self {
         WatchState {
-            watcher: Mutex::new(None),
+            watcher: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -43,10 +44,19 @@ pub fn init(app: &AppHandle, state: &WatchState) {
     };
     *state.watcher.lock().unwrap() = Some(watcher);
 
-    for wf in load_config().watched {
-        watch_path(state, &wf.path);
-        initial_scan(app.clone(), wf.path.clone(), wf.in_place);
-    }
+    // Подписка на папки и первичный скан — в фоне. w.watch() на недоступной
+    // сетевой/облачной папке (например, iCloud без интернета) может подвиснуть,
+    // а init() вызывается из setup-хука: блокировка здесь = белое окно на старте.
+    let arc = state.watcher.clone();
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        for wf in load_config().watched {
+            if let Some(w) = arc.lock().unwrap().as_mut() {
+                let _ = w.watch(Path::new(&wf.path), RecursiveMode::Recursive);
+            }
+            initial_scan(app2.clone(), wf.path.clone(), wf.in_place);
+        }
+    });
 }
 
 fn build_watcher(app: AppHandle) -> Option<RecommendedWatcher> {

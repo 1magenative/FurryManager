@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<title>Референс</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #16161c; color: #e8e6e3;
+               font: 13px/1.4 "Segoe UI", Ubuntu, Cantarell, "Noto Sans", system-ui, sans-serif;
+               overflow: hidden; }
+  /* Рамка — видно, что окно висит поверх остальных */
+  body { border: 2px solid #f28c38; }
+  #wrap { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+          overflow: hidden; }
+  img {
+    max-width: 100%; max-height: 100%; object-fit: contain;
+    user-select: none; -webkit-user-drag: none;
+    transition: transform .08s ease-out; will-change: transform;
+  }
+  /* Панель появляется при наведении, чтобы не мешать рисовать */
+  #bar {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+    background: rgba(20,20,26,.86); opacity: 0; transition: opacity .15s;
+  }
+  body:hover #bar { opacity: 1; }
+  button {
+    background: #262631; color: #e8e6e3; border: 1px solid #3a3a46;
+    border-radius: 8px; padding: 4px 9px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: #f28c38; }
+  button.on { border-color: #f28c38; color: #ffb46e; }
+  input[type=range] { width: 84px; }
+  .hint { color: #9a97a3; font-size: 11px; margin-left: auto; }
+  /* Контекстное меню */
+  #menu {
+    position: fixed; z-index: 20; min-width: 200px;
+    background: #1e1e26; border: 1px solid #3a3a46; border-radius: 10px;
+    padding: 5px; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  }
+  #menu .mi { padding: 7px 10px; border-radius: 7px; cursor: pointer; white-space: nowrap; }
+  #menu .mi:hover { background: #262631; }
+  #menu .sep { height: 1px; background: #3a3a46; margin: 4px 2px; }
+  .hidden { display: none !important; }
+  /* Плашка с подобранным цветом */
+  #swatch {
+    position: fixed; top: 8px; left: 8px; z-index: 15; display: flex; align-items: center; gap: 8px;
+    background: rgba(20,20,26,.9); border: 1px solid #3a3a46; border-radius: 8px;
+    padding: 5px 9px; font-size: 12px;
+  }
+  #swatch i { width: 16px; height: 16px; border-radius: 4px; border: 1px solid #555; display: block; }
+</style>
+</head>
+<body>
+  <div id="wrap"><img id="img" alt="" /></div>
+  <div id="swatch" class="hidden"><i id="sw-color"></i><span id="sw-hex"></span></div>
+  <div id="bar">
+    <button id="flip" title="Зеркало — проверить композицию">🪞</button>
+    <button id="rot" title="Повернуть на 90°">⟳</button>
+    <button id="reset" title="Сбросить зум и положение (двойной клик)">⤢</button>
+    <input id="op" type="range" min="20" max="100" value="100" title="Прозрачность" />
+    <span class="hint">ПКМ — меню · колесо — зум · тянуть — двигать</span>
+  </div>
+  <div id="menu" class="hidden"></div>
+<script>
+const params = new URLSearchParams(location.search);
+const SRC = params.get("src") || "";
+const PATH = params.get("path") || "";
+const FILE_ID = Number(params.get("id") || 0);
+const img = document.getElementById("img");
+const wrap = document.getElementById("wrap");
+img.src = SRC;
+document.title = "Референс — " + (params.get("name") || "арт");
+
+// ---------- Зум и панорама (как в просмотрщике менеджера) ----------
+const z = { scale: 1, x: 0, y: 0, flip: false, rot: 0, panning: false, sx: 0, sy: 0, pipette: false };
+function apply() {
+  img.style.transform =
+    `translate(${z.x}px, ${z.y}px) scale(${z.scale}) rotate(${z.rot}deg) scaleX(${z.flip ? -1 : 1})`;
+  wrap.style.cursor = z.pipette ? "crosshair" : z.scale !== 1 ? "grab" : "";
+}
+function resetView() { z.scale = 1; z.x = 0; z.y = 0; apply(); }
+
+// Зум к курсору: точка под мышкой остаётся на месте
+wrap.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const old = z.scale;
+  const next = Math.min(12, Math.max(0.2, old * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+  if (next === old) return;
+  const r = wrap.getBoundingClientRect();
+  const mx = e.clientX - r.left - r.width / 2;
+  const my = e.clientY - r.top - r.height / 2;
+  const k = next / old;
+  z.x = mx - (mx - z.x) * k;
+  z.y = my - (my - z.y) * k;
+  z.scale = next;
+  apply();
+}, { passive: false });
+
+wrap.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  if (z.pipette) { pickColor(e); return; }
+  z.panning = true; z.sx = e.clientX - z.x; z.sy = e.clientY - z.y;
+  wrap.style.cursor = "grabbing";
+  e.preventDefault();
+});
+window.addEventListener("mousemove", (e) => {
+  if (!z.panning) return;
+  z.x = e.clientX - z.sx; z.y = e.clientY - z.sy; apply();
+});
+window.addEventListener("mouseup", () => { z.panning = false; apply(); });
+wrap.addEventListener("dblclick", resetView);
+img.addEventListener("dragstart", (e) => e.preventDefault());
+
+document.getElementById("flip").addEventListener("click", (e) => {
+  z.flip = !z.flip; e.currentTarget.classList.toggle("on", z.flip); apply();
+});
+document.getElementById("rot").addEventListener("click", () => { z.rot = (z.rot + 90) % 360; apply(); });
+document.getElementById("reset").addEventListener("click", resetView);
+document.getElementById("op").addEventListener("input", (e) => {
+  wrap.style.opacity = e.target.value / 100;
+});
+
+// ---------- Пипетка ----------
+let bitmap = null;
+async function ensureBitmap() {
+  if (bitmap) return bitmap;
+  const blob = await (await fetch(SRC)).blob();
+  bitmap = await createImageBitmap(blob);
+  return bitmap;
+}
+async function pickColor(e) {
+  try {
+    const bm = await ensureBitmap();
+    const r = img.getBoundingClientRect();
+    // Клик → доля внутри показанной рамки → пиксель оригинала.
+    const u = (e.clientX - r.left) / r.width;
+    const v = (e.clientY - r.top) / r.height;
+    if (u < 0 || u > 1 || v < 0 || v > 1) return;
+    // Разворачиваем поворот (рамка при 90/270° повёрнута) и зеркало.
+    let px, py;
+    const rot = ((z.rot % 360) + 360) % 360;
+    if (rot === 90) { px = v; py = 1 - u; }
+    else if (rot === 180) { px = 1 - u; py = 1 - v; }
+    else if (rot === 270) { px = 1 - v; py = u; }
+    else { px = u; py = v; }
+    if (z.flip) px = 1 - px; // scaleX применяется до поворота
+    const cv = document.createElement("canvas");
+    cv.width = 1; cv.height = 1;
+    cv.getContext("2d").drawImage(bm, Math.floor(px * bm.width), Math.floor(py * bm.height), 1, 1, 0, 0, 1, 1);
+    const d = cv.getContext("2d").getImageData(0, 0, 1, 1).data;
+    const hex = "#" + [d[0], d[1], d[2]].map((v) => v.toString(16).padStart(2, "0")).join("").toUpperCase();
+    document.getElementById("sw-color").style.background = hex;
+    document.getElementById("sw-hex").textContent = hex + " (скопирован)";
+    document.getElementById("swatch").classList.remove("hidden");
+    try { await navigator.clipboard.writeText(hex); } catch {}
+  } catch (err) { console.warn("пипетка:", err); }
+}
+
+// ---------- Контекстное меню ----------
+const menu = document.getElementById("menu");
+function hideMenu() { menu.classList.add("hidden"); }
+document.addEventListener("click", hideMenu);
+window.addEventListener("blur", hideMenu);
+
+wrap.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  const items = [
+    { label: z.pipette ? "🎨 Выключить пипетку" : "🎨 Пипетка — кликни по цвету",
+      run: () => { z.pipette = !z.pipette; apply(); } },
+    { sep: true },
+    { label: "🔍 Открыть в менеджере", run: locateInManager },
+    { label: "📂 Показать в проводнике", run: revealInExplorer },
+    { label: "📋 Копировать арт", run: copyArt },
+    { sep: true },
+    { label: "↩ Сбросить зум и положение", run: resetView },
+  ];
+  menu.innerHTML = items
+    .map((it, i) => (it.sep ? `<div class="sep"></div>` : `<div class="mi" data-i="${i}">${it.label}</div>`))
+    .join("");
+  menu.classList.remove("hidden");
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.min(e.clientX, window.innerWidth - r.width - 8) + "px";
+  menu.style.top = Math.min(e.clientY, window.innerHeight - r.height - 8) + "px";
+  menu.querySelectorAll(".mi").forEach((el) => {
+    el.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      hideMenu();
+      const it = items[Number(el.dataset.i)];
+      if (it && it.run) it.run();
+    });
+  });
+});
+
+// Попросить главное окно открыть этот арт (событие ловит менеджер)
+async function locateInManager() {
+  try {
+    await window.__TAURI__.event.emit("ref-locate", { id: FILE_ID });
+  } catch (e) { alert("Не удалось: " + e); }
+}
+async function revealInExplorer() {
+  try {
+    await window.__TAURI__.opener.revealItemInDir(PATH);
+  } catch (e) { alert("Не удалось показать файл: " + e); }
+}
+async function copyArt() {
+  try {
+    const blob = await (await fetch(SRC)).blob();
+    let png = blob;
+    if (blob.type !== "image/png") {
+      const bm = await createImageBitmap(blob);
+      const cv = document.createElement("canvas");
+      cv.width = bm.width; cv.height = bm.height;
+      cv.getContext("2d").drawImage(bm, 0, 0);
+      png = await new Promise((res) => cv.toBlob(res, "image/png"));
+    }
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+  } catch (e) { alert("Не удалось скопировать: " + e); }
+}
+
+apply();
+</script>
+</body>
+</html>

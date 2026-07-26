@@ -9,7 +9,7 @@ const $ = (id) => document.getElementById(id);
 const MEDIA_EXTS = ["jpg", "jpeg", "jfif", "png", "webp", "bmp", "gif", "mp4", "webm", "mov", "m4v", "heic", "heif"];
 
 const state = {
-  mode: "basic",
+  mode: "simple",
   query: "",
   offset: 0,
   limit: 120,
@@ -35,6 +35,18 @@ const state = {
   simFor: null,          // по какому арту искали похожих
   lossless: false,       // сжимать PNG → WebP без потерь при копировании
   lan: false,            // приём артов с телефона по локальной сети
+  hideNsfw: false,       // режим тотального скрытия NSFW (коллекции + фильтр)
+  favOnly: false,        // фильтр «только избранное» (★)
+  sort: null,            // порядок галереи: null=новые, old/big/small/views/random
+  randSeed: 1,           // зерно «случайной» сортировки (стабильный порядок)
+  display: null,         // тема, размер миниатюр, водопад, бейджи, компакт
+  useTrash: true,        // удалять через корзину
+  trashDays: 30,         // через сколько дней чистить корзину (0 = никогда)
+  gifAuto: false,        // авто-конвертация коротких видео в GIF
+  gifSecs: 5,            // порог длительности для видео→GIF
+  gifReplace: false,     // заменять оригинал видео на GIF
+  gifFps: 15,            // кадров/сек в GIF
+  gifWidth: 480,         // макс. сторона GIF, px
   ready: false,          // init() завершён — до этого автоподгрузку не запускаем
   pendingReset: false,   // сброс пришёл во время загрузки — повторить после
 
@@ -64,25 +76,136 @@ function parseTag(raw) {
 function updatePlaceholder() {
   $("search").placeholder = state.smart
     ? "Умный поиск: red fox in jacket, можно с фильтрами: gif species:fox…"
-    : state.mode === "advanced"
+    : state.mode !== "simple"
       ? "Поиск: раса:лис -эскиз куртка gif…"
       : "Поиск: лис, куртка… (Enter)";
 }
 
+// Режимы: simple | user | artist. Старые значения из конфига приводим к новым.
+function normMode(m) {
+  if (m === "basic") return "simple";
+  if (m === "advanced") return "user";
+  return (m === "simple" || m === "user" || m === "artist") ? m : "simple";
+}
 function applyMode(mode) {
-  state.mode = mode;
-  document.body.dataset.mode = mode;
+  state.mode = normMode(mode);
+  document.body.dataset.mode = state.mode;
   updatePlaceholder();
 }
 
+// ---------- Настройки отображения (тема, сетка, водопад, бейджи, компакт) ----------
+// Это визуальные предпочтения конкретного компьютера — храним локально.
+const DISPLAY_DEFAULTS = { theme: "dark", thumb: 200, masonry: false, nobadges: false,
+                           compact: false, nocolscroll: true };
+function loadDisplay() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem("fm_display") || "{}"); } catch {}
+  return Object.assign({}, DISPLAY_DEFAULTS, saved || {});
+}
+function saveDisplay(d) {
+  try { localStorage.setItem("fm_display", JSON.stringify(d)); } catch {}
+}
+function applyDisplay(d) {
+  state.display = d;
+  document.documentElement.dataset.theme = d.theme || "dark";
+  document.documentElement.style.setProperty("--thumb", (d.thumb || 200) + "px");
+  document.body.classList.toggle("masonry", !!d.masonry);
+  document.body.classList.toggle("nobadges", !!d.nobadges);
+  document.body.classList.toggle("compact", !!d.compact);
+  document.body.classList.toggle("nocolscroll", !!d.nocolscroll);
+}
+
+// ---------- Раскладка галереи ----------
+// В обычном режиме — CSS-сетка. В «водопаде» карточки раскладываем по колонкам
+// сами (по кругу), иначе браузерные CSS-колонки пустят порядок сверху вниз по
+// первой колонке — читать ленту становится неудобно.
+let masonrySeq = 0; // сколько карточек уже разложено (для продолжения по кругу)
+function isMasonry() { return document.body.classList.contains("masonry"); }
+function masonryColCount() {
+  const g = $("gallery");
+  const w = g.clientWidth || 1200;
+  const thumb = (state.display && state.display.thumb) || 200;
+  return Math.max(1, Math.floor((w + 12) / (thumb + 12)));
+}
+function ensureMasonryCols() {
+  const g = $("gallery");
+  const need = masonryColCount();
+  const cols = g.querySelectorAll(":scope > .mcol");
+  if (cols.length === need) return;
+  // Пересобираем: собираем карточки в исходном порядке и раскладываем заново
+  const cards = [...g.querySelectorAll(".card")].sort(
+    (a, b) => Number(a.dataset.i) - Number(b.dataset.i));
+  g.innerHTML = "";
+  for (let i = 0; i < need; i++) {
+    g.insertAdjacentHTML("beforeend", `<div class="mcol"></div>`);
+  }
+  const fresh = g.querySelectorAll(":scope > .mcol");
+  masonrySeq = 0;
+  cards.forEach((el) => { fresh[masonrySeq % need].appendChild(el); masonrySeq++; });
+}
+function galleryClear() {
+  $("gallery").innerHTML = "";
+  masonrySeq = 0;
+  if (isMasonry()) ensureMasonryCols();
+}
+function galleryAppend(html) {
+  const g = $("gallery");
+  if (!isMasonry()) { g.insertAdjacentHTML("beforeend", html); return; }
+  ensureMasonryCols();
+  const cols = g.querySelectorAll(":scope > .mcol");
+  if (!cols.length) { g.insertAdjacentHTML("beforeend", html); return; }
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+  while (tmp.firstElementChild) {
+    cols[masonrySeq % cols.length].appendChild(tmp.firstElementChild);
+    masonrySeq++;
+  }
+}
+function gallerySet(html) { galleryClear(); galleryAppend(html); }
+// Перерисовать уже загруженные карточки (смена вида/размера миниатюр)
+function rerenderGallery() {
+  gallerySet(state.cards.map((c, k) => cardHtml(c, k)).join(""));
+}
+// Число колонок зависит от ширины окна
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  if (!isMasonry()) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(ensureMasonryCols, 150);
+});
+
 // ---------- Настройки ----------
 function openSettings() {
-  document.querySelector(`input[name="set-mode"][value="${state.mode}"]`).checked = true;
+  const modeInput = document.querySelector(`input[name="set-mode"][value="${state.mode}"]`);
+  if (modeInput) modeInput.checked = true;
+  // Отображение
+  const d = state.display || loadDisplay();
+  const th = document.querySelector(`input[name="set-theme"][value="${d.theme}"]`);
+  if (th) th.checked = true;
+  $("set-grid-size").value = d.thumb;
+  $("set-grid-size-val").textContent = d.thumb + " px";
+  $("set-masonry").checked = !!d.masonry;
+  $("set-hide-badges").checked = !!d.nobadges;
+  $("set-compact").checked = !!d.compact;
+  $("set-hide-colscroll").checked = !!d.nocolscroll;
+  // Корзина
+  $("set-use-trash").checked = state.useTrash !== false;
+  $("set-trash-days").value = state.trashDays ?? 30;
+  $("trash-days-wrap").classList.toggle("hidden", state.useTrash === false);
+  refreshTrashBadge();
   $("set-nsfw-split").checked = state.nsfwSplit;
   $("set-lossless").checked = state.lossless;
   $("set-lan").checked = state.lan;
   $("set-cookies").value = state.browserCookies || "";
+  $("set-hide-nsfw").checked = !!state.hideNsfw;
+  $("set-gif-auto").checked = !!state.gifAuto;
+  $("set-gif-secs").value = state.gifSecs || 5;
+  $("set-gif-fps").value = state.gifFps || 15;
+  $("set-gif-width").value = state.gifWidth || 480;
+  $("set-gif-replace").checked = !!state.gifReplace;
   updateLanSetup();
+  refreshTsStatus();
+  refreshTgStatus();
   $("set-default-filter").value =
     state.defaultNsfw === 0 ? "0" : state.defaultNsfw === 1 ? "1" : "";
   updateDefaultFilterVis();
@@ -103,6 +226,136 @@ function openSettings() {
   $("lib-path").textContent = state.libraryRoot || "не выбрана";
   $("settings").classList.remove("hidden");
 }
+
+// Отображение — применяется сразу (кнопка «Сохранить» не нужна).
+function onDisplayChange() {
+  const d = {
+    theme: (document.querySelector('input[name="set-theme"]:checked') || {}).value || "dark",
+    thumb: Math.max(120, Math.min(360, Number($("set-grid-size").value) || 200)),
+    masonry: $("set-masonry").checked,
+    nobadges: $("set-hide-badges").checked,
+    compact: $("set-compact").checked,
+    nocolscroll: $("set-hide-colscroll").checked,
+  };
+  $("set-grid-size-val").textContent = d.thumb + " px";
+  const prev = state.display || {};
+  const relayout = prev.masonry !== d.masonry || prev.thumb !== d.thumb;
+  saveDisplay(d);
+  applyDisplay(d);
+  // Смена вида/размера меняет число колонок — перекладываем уже загруженное
+  if (relayout && state.cards.length) rerenderGallery();
+}
+document.querySelectorAll('input[name="set-theme"]').forEach((el) =>
+  el.addEventListener("change", onDisplayChange));
+$("set-grid-size").addEventListener("input", onDisplayChange);
+["set-masonry", "set-hide-badges", "set-compact", "set-hide-colscroll"].forEach((id) =>
+  $(id).addEventListener("change", onDisplayChange));
+
+// ---------- Корзина ----------
+async function saveTrashSettings() {
+  const useTrash = $("set-use-trash").checked;
+  const days = Math.max(0, Math.min(365, Number($("set-trash-days").value) || 0));
+  state.useTrash = useTrash;
+  state.trashDays = days;
+  $("trash-days-wrap").classList.toggle("hidden", !useTrash);
+  try { await invoke("set_trash_settings", { useTrash, days }); } catch (e) { alert(e); }
+}
+$("set-use-trash").addEventListener("change", saveTrashSettings);
+$("set-trash-days").addEventListener("change", saveTrashSettings);
+
+async function refreshTrashBadge() {
+  try {
+    const n = await invoke("trash_count");
+    $("trash-badge").textContent = n ? ` (${n})` : "";
+  } catch { $("trash-badge").textContent = ""; }
+}
+
+let trashItems = [];
+const trashMarked = new Set();
+async function openTrash() {
+  $("trash").classList.remove("hidden");
+  $("trash-status").textContent = "Загружаю…";
+  $("trash-list").innerHTML = "";
+  trashMarked.clear();
+  try { trashItems = await invoke("trash_list"); }
+  catch (e) { $("trash-status").textContent = "Ошибка: " + e; return; }
+  renderTrash();
+}
+function renderTrash() {
+  const days = state.trashDays ?? 30;
+  $("trash-status").textContent = trashItems.length
+    ? `В корзине: ${trashItems.length}` + (days > 0 ? ` · автоочистка через ${days} дн.` : " · автоочистка выключена")
+    : "Корзина пуста";
+  $("trash-all").checked = trashItems.length > 0 && trashMarked.size === trashItems.length;
+  $("trash-list").innerHTML = trashItems.map((t) => {
+    const when = new Date((t.deleted_at || 0) * 1000).toLocaleDateString();
+    const img = t.preview
+      ? `<img loading="lazy" src="${mediaSrc(t.preview)}" alt=""/>`
+      : `<div class="noimg">${t.kind === "video" ? "🎬" : "🖼"}</div>`;
+    return `<div class="tr-item ${trashMarked.has(t.id) ? "marked" : ""}" data-id="${t.id}">` +
+      `${img}<div class="tr-meta">${esc(t.name || t.sha256.slice(0, 8))}<br/>удалён ${when}</div></div>`;
+  }).join("");
+  updateTrashBtns();
+}
+function updateTrashBtns() {
+  const n = trashMarked.size;
+  $("trash-restore").textContent = `↩ Восстановить (${n})`;
+  $("trash-del").textContent = `🗑 Удалить навсегда (${n})`;
+  $("trash-restore").disabled = n === 0;
+  $("trash-del").disabled = n === 0;
+}
+$("trash-list").addEventListener("click", (e) => {
+  const item = e.target.closest(".tr-item[data-id]");
+  if (!item) return;
+  const id = Number(item.dataset.id);
+  if (trashMarked.has(id)) trashMarked.delete(id); else trashMarked.add(id);
+  item.classList.toggle("marked", trashMarked.has(id));
+  $("trash-all").checked = trashMarked.size === trashItems.length;
+  updateTrashBtns();
+});
+$("trash-all").addEventListener("change", (e) => {
+  trashMarked.clear();
+  if (e.target.checked) trashItems.forEach((t) => trashMarked.add(t.id));
+  renderTrash();
+});
+$("trash-restore").addEventListener("click", async () => {
+  if (!trashMarked.size) return;
+  try {
+    const n = await invoke("trash_restore", { ids: [...trashMarked] });
+    trashMarked.clear();
+    await openTrash();
+    refreshStats(); refreshCollections(); loadMore(true); refreshTrashBadge();
+    if (n) backgroundIndex(); // вернувшимся артам вернём и превью/индексацию
+  } catch (e) { alert(e); }
+});
+$("trash-del").addEventListener("click", async () => {
+  if (!trashMarked.size) return;
+  const yes = await tauriDialog.ask(
+    `Удалить ${trashMarked.size} арт(ов) НАВСЕГДА? Восстановить будет нельзя.`,
+    { title: "FurryManager", kind: "warning" });
+  if (!yes) return;
+  try {
+    await invoke("trash_purge", { ids: [...trashMarked] });
+    trashMarked.clear();
+    await openTrash();
+    refreshTrashBadge();
+  } catch (e) { alert(e); }
+});
+$("trash-empty").addEventListener("click", async () => {
+  if (!trashItems.length) return;
+  const yes = await tauriDialog.ask(
+    "Очистить корзину полностью? Все удалённые арты исчезнут безвозвратно.",
+    { title: "FurryManager", kind: "warning" });
+  if (!yes) return;
+  try {
+    await invoke("trash_purge", { ids: [] });
+    await openTrash();
+    refreshTrashBadge();
+  } catch (e) { alert(e); }
+});
+$("btn-trash").addEventListener("click", openTrash);
+$("trash-close").addEventListener("click", () => $("trash").classList.add("hidden"));
+$("trash").addEventListener("click", (e) => { if (e.target === $("trash")) $("trash").classList.add("hidden"); });
 
 // «Фильтр при запуске» показываем только когда включены вкладки SFW/NSFW.
 function updateDefaultFilterVis() {
@@ -126,6 +379,90 @@ async function updateLanSetup() {
 }
 $("set-lan").addEventListener("change", updateLanSetup);
 
+// ---------- Tailscale-доступ (офлайн-галерея на телефоне) ----------
+async function refreshTsStatus() {
+  const el = $("ts-status");
+  el.textContent = "Проверяю Tailscale…";
+  let st;
+  try { st = await invoke("ts_status"); } catch (e) { el.textContent = "Не удалось проверить: " + e; return; }
+  if (!st.installed) {
+    el.innerHTML = "Tailscale не найден. Скачай с <b>tailscale.com/download</b>, установи на ПК и на телефон, войди в один аккаунт — и нажми кнопку.";
+    $("ts-disable").classList.add("hidden");
+    return;
+  }
+  if (!st.running) {
+    el.textContent = "Tailscale установлен, но не в сети. Открой приложение Tailscale и войди в аккаунт.";
+    $("ts-disable").classList.add("hidden");
+    return;
+  }
+  el.textContent = st.dns_name ? ("Tailscale в сети: " + st.dns_name) : "Tailscale в сети.";
+}
+
+$("ts-enable").addEventListener("click", async () => {
+  const btn = $("ts-enable");
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "Включаю…";
+  try {
+    const r = await invoke("ts_serve_enable");
+    $("ts-qr").innerHTML = r.svg;
+    $("ts-url").innerHTML = "Адрес: <b>" + esc(r.url) + "</b>";
+    $("ts-setup").classList.remove("hidden");
+    $("ts-disable").classList.remove("hidden");
+    $("ts-status").textContent = "Доступ включён. Открой адрес на телефоне и добавь на экран «Домой».";
+  } catch (e) {
+    alert("Tailscale: " + e);
+    refreshTsStatus();
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+});
+
+$("ts-disable").addEventListener("click", async () => {
+  try {
+    await invoke("ts_serve_disable");
+    $("ts-setup").classList.add("hidden");
+    $("ts-disable").classList.add("hidden");
+    $("ts-status").textContent = "Доступ через Tailscale выключен.";
+  } catch (e) { alert(e); }
+});
+
+// ---------- Telegram-бот-загрузчик ----------
+async function refreshTgStatus() {
+  let st;
+  try { st = await invoke("tg_status"); } catch { st = { enabled: false }; }
+  const on = st.enabled && st.has_token;
+  $("tg-disconnect").classList.toggle("hidden", !on);
+  $("tg-status").textContent = on
+    ? "Бот подключён — пересылай ему фото/видео/гиф."
+    : "Бот не подключён.";
+  if (on) $("tg-token").placeholder = "токен сохранён (вставь новый, чтобы сменить)";
+}
+
+$("tg-connect").addEventListener("click", async () => {
+  const token = $("tg-token").value.trim();
+  if (!token) { alert("Вставь токен бота от @BotFather"); return; }
+  const btn = $("tg-connect");
+  const old = btn.textContent; btn.disabled = true; btn.textContent = "Проверяю…";
+  try {
+    const r = await invoke("tg_enable", { token });
+    $("tg-token").value = ""; // не держим токен в поле
+    $("tg-status").textContent = `Подключён: @${r.username}. Пересылай боту фото/видео/гиф.`;
+    $("tg-disconnect").classList.remove("hidden");
+  } catch (e) {
+    $("tg-status").textContent = "Ошибка: " + e;
+  } finally {
+    btn.disabled = false; btn.textContent = old;
+  }
+});
+
+$("tg-disconnect").addEventListener("click", async () => {
+  try {
+    await invoke("tg_disable");
+    $("tg-status").textContent = "Бот отключён.";
+    $("tg-disconnect").classList.add("hidden");
+  } catch (e) { alert(e); }
+});
+
 // Управление коллекциями внутри настроек (порядок / переименование / удаление).
 function renderSettingsCollections() {
   const box = $("set-collections");
@@ -134,18 +471,41 @@ function renderSettingsCollections() {
     box.innerHTML = `<div class="muted small">Коллекций пока нет. Создай первую на главном экране — «＋ Новая» в панели под поиском.</div>`;
     return;
   }
-  const last = state.collections.length - 1;
-  box.innerHTML = state.collections.map((c, i) => (
+  // В режиме скрытия NSFW не показываем NSFW-коллекции и здесь (иначе видно имена).
+  const cols = state.hideNsfw ? state.collections.filter((c) => !c.is_nsfw) : state.collections;
+  const last = cols.length - 1;
+  let html = cols.map((c, i) => (
     `<div class="set-col-row" data-id="${c.id}">` +
       `<span class="set-col-name">${esc(c.name)}</span>` +
       `<span class="cnt">${c.count}</span>` +
+      `<select class="set-col-rate" data-act="rating" title="Рейтинг коллекции (для режима скрытия NSFW): авто — по содержимому">` +
+        `<option value="" ${c.nsfw == null ? "selected" : ""}>авто</option>` +
+        `<option value="0" ${c.nsfw === 0 ? "selected" : ""}>SFW</option>` +
+        `<option value="1" ${c.nsfw === 1 ? "selected" : ""}>NSFW</option>` +
+      `</select>` +
       `<button data-act="up" title="Выше" ${i === 0 ? "disabled" : ""}>↑</button>` +
       `<button data-act="down" title="Ниже" ${i === last ? "disabled" : ""}>↓</button>` +
       `<button data-act="rename" title="Переименовать">✎</button>` +
       `<button data-act="del" title="Удалить (арты останутся)">🗑</button>` +
     `</div>`
   )).join("");
+  if (state.hideNsfw && cols.length < state.collections.length) {
+    html += `<div class="muted small" style="margin-top:6px;">NSFW-коллекции скрыты режимом. Выключите его выше, чтобы управлять ими.</div>`;
+  }
+  box.innerHTML = html;
 }
+
+// Смена рейтинга коллекции (авто/SFW/NSFW) в списке настроек
+$("set-collections").addEventListener("change", async (e) => {
+  const sel = e.target.closest("select[data-act='rating']");
+  if (!sel) return;
+  const id = Number(sel.closest(".set-col-row").dataset.id);
+  const val = sel.value === "" ? null : Number(sel.value);
+  try {
+    await invoke("set_collection_nsfw", { id, nsfw: val });
+    await refreshCollections(); // is_nsfw пересчитается
+  } catch (err) { alert(err); }
+});
 
 async function moveCollection(id, dir) {
   const ids = state.collections.map((c) => c.id);
@@ -339,7 +699,7 @@ $("btn-import-lib").addEventListener("click", async () => {
     $("settings").classList.add("hidden");
     // Всё новое: настройки, коллекции, лента
     const setup = await invoke("get_setup_state");
-    applyMode(setup.mode || "basic");
+    applyMode(setup.mode || "simple");
     state.nsfwSplit = !!setup.nsfw_split;
     state.lossless = !!setup.lossless;
     state.defaultNsfw = setup.default_nsfw ?? null;
@@ -443,11 +803,11 @@ async function refreshStats() {
       `${s.files} файлов (${s.images} картинок, ${s.videos} видео) · ` +
       `${fmtBytes(s.total_bytes)} · дубликатов пропущено: ${s.dupes_skipped}`;
     // Счётчик текущего вида — когда включён какой-то фильтр
-    if (state.query || state.collection !== null || state.nsfw !== null || state.recent) {
+    if (state.query || state.collection !== null || state.nsfw !== null || state.recent || state.favOnly) {
       try {
         const m = await invoke("count_files", {
           search: state.query, collection: state.collection, nsfw: state.nsfw,
-          recent: state.recent,
+          recent: state.recent, favorite: state.favOnly,
         });
         text += ` · в текущем виде: ${m}`;
       } catch {}
@@ -477,7 +837,7 @@ async function reloadKeepScroll() {
   state.lastIndex = null;
   state.pendingReset = false;
   clearSelection();
-  $("gallery").innerHTML = "";
+  galleryClear();
   refreshStats();
   while (state.cards.length < target && !state.reachedEnd) {
     const before = state.cards.length;
@@ -503,19 +863,74 @@ async function refreshCollections() {
   if (state.viewerIndex >= 0) renderViewerCollections();
 }
 
+// ---------- Тотальное скрытие NSFW ----------
+async function applyHideNsfw(on) {
+  state.hideNsfw = on;
+  if (on) state.nsfw = 0; // залочить фильтр на SFW
+  await refreshCollections(); // подтянет is_nsfw и перерисует бар с учётом режима
+  if (on) {
+    const cur = state.collections.find((c) => c.id === state.collection);
+    if (cur && cur.is_nsfw) state.collection = null; // была открыта NSFW-коллекция
+    renderCollectionsBar();
+  }
+  doSearch($("search").value);
+}
+
+// want=undefined — переключить; иначе задать. Выключение при включённом ПИН
+// требует ввода ПИН (включение — свободно, оно лишь усиливает приватность).
+async function toggleHideNsfw(want) {
+  const target = (want === undefined) ? !state.hideNsfw : want;
+  if (target === state.hideNsfw) return;
+  if (state.hideNsfw && !target && state.pinEnabled) {
+    const pin = prompt("Введите ПИН, чтобы выключить скрытие NSFW:");
+    if (pin === null) { const t = $("set-hide-nsfw"); if (t) t.checked = true; return; }
+    let ok = false;
+    try { ok = await invoke("pin_verify", { pin }); } catch { ok = false; }
+    if (!ok) { alert("Неверный ПИН"); const t = $("set-hide-nsfw"); if (t) t.checked = true; return; }
+  }
+  try { await invoke("set_hide_nsfw", { on: target }); } catch (e) { return alert(e); }
+  await applyHideNsfw(target);
+  const t = $("set-hide-nsfw"); if (t) t.checked = target;
+}
+$("set-hide-nsfw").addEventListener("change", (e) => toggleHideNsfw(e.target.checked));
+
+// Настройки видео→GIF применяются сразу
+function applyGifSettings() {
+  const auto = $("set-gif-auto").checked;
+  const secs = Math.max(1, Math.min(60, Number($("set-gif-secs").value) || 5));
+  const fps = Math.max(5, Math.min(30, Number($("set-gif-fps").value) || 15));
+  const width = Math.max(120, Math.min(960, Number($("set-gif-width").value) || 480));
+  const replace = $("set-gif-replace").checked;
+  state.gifAuto = auto; state.gifSecs = secs; state.gifReplace = replace;
+  state.gifFps = fps; state.gifWidth = width;
+  invoke("set_gif_settings", { auto, secs, replace, fps, width }).catch((e) => alert(e));
+}
+$("set-gif-auto").addEventListener("change", applyGifSettings);
+$("set-gif-secs").addEventListener("change", applyGifSettings);
+$("set-gif-fps").addEventListener("change", applyGifSettings);
+$("set-gif-width").addEventListener("change", applyGifSettings);
+$("set-gif-replace").addEventListener("change", applyGifSettings);
+
 function renderCollectionsBar() {
   const bar = $("collections-bar");
+  const hide = state.hideNsfw; // режим тотального скрытия NSFW
   const chips = [];
+  // Область коллекций: Все + Без коллекции (рядом).
   chips.push(`<span class="col-chip ${state.collection === null ? "active" : ""}" data-id="">📚 Все</span>`);
+  chips.push(`<span class="col-chip ${state.collection === -1 ? "active" : ""}" data-id="-1" title="Арты, которые не состоят ни в одной коллекции">📥 Без коллекции</span>`);
+  // Разделитель, затем атрибуты: SFW/NSFW и Недавние.
+  chips.push(`<span class="col-sep"></span>`);
   if (state.nsfwSplit) {
     chips.push(`<span class="col-chip ${state.nsfw === 0 ? "active" : ""}" data-nsfw="0" title="Только безопасные арты">🌱 SFW</span>`);
-    chips.push(`<span class="col-chip ${state.nsfw === 1 ? "active" : ""}" data-nsfw="1" title="Только 18+ (по рейтингу ИИ или ручной пометке)">🔞 NSFW</span>`);
+    // В режиме скрытия NSFW-вкладку не показываем — фильтр залочен на SFW.
+    if (!hide) chips.push(`<span class="col-chip ${state.nsfw === 1 ? "active" : ""}" data-nsfw="1" title="Только 18+ (по рейтингу ИИ или ручной пометке)">🔞 NSFW</span>`);
   }
-  chips.push(`<span class="col-chip ${state.collection === -1 ? "active" : ""}" data-id="-1" title="Арты, которые не состоят ни в одной коллекции">📥 Без коллекции</span>`);
+  chips.push(`<span class="col-chip ${state.favOnly ? "active" : ""}" data-fav="1" title="Только избранное (★). Пометить: правый клик по арту или клавиша F">★ Избранное</span>`);
   chips.push(`<span class="col-chip ${state.recent ? "active" : ""}" data-recent="1" title="История просмотров: недавно открытые арты (свежие сверху)">🕘 Недавние</span>`);
-  // Разделитель: слева фильтры, справа — коллекции пользователя
+  // Разделитель перед коллекциями пользователя.
   chips.push(`<span class="col-sep"></span>`);
   for (const c of state.collections) {
+    if (hide && c.is_nsfw) continue; // NSFW-коллекции скрыты (вместе с названиями)
     chips.push(
       `<span class="col-chip ${state.collection === c.id ? "active" : ""}" data-id="${c.id}" ` +
       `title="Показать только эту коллекцию. Порядок, переименование и удаление — в ⚙ Настройках.">` +
@@ -525,6 +940,64 @@ function renderCollectionsBar() {
   chips.push(`<span class="col-chip" id="col-new" title="Коллекция — как альбом: один арт может быть в нескольких">＋ Новая</span>`);
   bar.innerHTML = chips.join("");
 }
+
+// Сортировка галереи. Для «случайно» держим зерно: порядок не меняется при
+// удалении/подгрузке (иначе арты «уезжают» и страницы дублируются).
+function newRandSeed() { state.randSeed = 1 + Math.floor(Math.random() * 2000000000); }
+function updateSortUi() {
+  $("sort-wrap").classList.toggle("custom", !!state.sort);
+  $("sort-shuffle").classList.toggle("hidden", state.sort !== "random");
+}
+$("sort-select").addEventListener("change", (e) => {
+  state.sort = e.target.value || null;
+  if (state.sort === "random") newRandSeed(); // новый выбор — новое перемешивание
+  try { localStorage.setItem("fm_sort", state.sort || ""); } catch {}
+  updateSortUi();
+  loadMore(true);
+});
+$("sort-shuffle").addEventListener("click", () => {
+  newRandSeed();
+  loadMore(true);
+});
+
+// Индикатор ★ в просмотрщике (и подсветка кнопки)
+function updateViewerFav() {
+  const btn = $("viewer-fav");
+  if (!btn) return;
+  const c = viewerCard();
+  const on = !!(c && c.favorite);
+  btn.textContent = on ? "★" : "☆";
+  btn.classList.toggle("on", on);
+  btn.title = on ? "Убрать из избранного (F)" : "В избранное (F)";
+}
+
+// Пометить/снять ★ у артов
+async function setFavorite(ids, on) {
+  try {
+    await invoke("set_favorite", { fileIds: ids, on });
+    ids.forEach((id) => {
+      const c = state.cards.find((x) => x.id === id);
+      if (c) c.favorite = on;
+      // Открытая группа/подборка живёт отдельным списком — обновляем и его
+      if (state.g && state.g.files) {
+        const g = state.g.files.find((x) => x.id === id);
+        if (g) g.favorite = on;
+      }
+      const el = document.querySelector(`.card[data-id="${id}"]`);
+      if (!el) return;
+      const cur = el.querySelector(".fav");
+      if (on && !cur) el.insertAdjacentHTML("beforeend", `<div class="fav">★</div>`);
+      if (!on && cur) cur.remove();
+    });
+    updateViewerFav();
+    // В режиме «только избранное» снятое должно исчезнуть из выдачи
+    if (state.favOnly && !on) reloadKeepScroll();
+  } catch (e) { alert(e); }
+}
+$("viewer-fav").addEventListener("click", () => {
+  const c = viewerCard();
+  if (c) setFavorite([c.id], !c.favorite);
+});
 
 // Колесо мыши листает панель коллекций горизонтально (вертикального скролла у неё нет)
 $("collections-bar").addEventListener("wheel", (e) => {
@@ -560,8 +1033,16 @@ $("collections-bar").addEventListener("click", async (e) => {
     doSearch($("search").value);
     return;
   }
+  // Только избранное
+  if (chip.dataset.fav !== undefined) {
+    state.favOnly = !state.favOnly;
+    renderCollectionsBar();
+    doSearch($("search").value);
+    return;
+  }
   // Вкладки SFW/NSFW
   if (chip.dataset.nsfw !== undefined) {
+    if (state.hideNsfw) { state.nsfw = 0; renderCollectionsBar(); return; } // залочено на SFW
     const v = Number(chip.dataset.nsfw);
     state.nsfw = state.nsfw === v ? null : v; // повторный клик снимает фильтр
     renderCollectionsBar();
@@ -587,6 +1068,7 @@ function cardHtml(card, i) {
       ? `<img loading="lazy" src="${mediaSrc(card.path)}" alt="" />`
       : `<div class="noimg">🎬</div>`;
   const sel = state.selected.has(card.id) ? " selected" : "";
+  const fav = card.favorite ? `<div class="fav">★</div>` : "";
 
   if (isStack) {
     // Стопка: за обложкой выглядывают верхушки следующих страниц (макс. 2 слоя)
@@ -596,9 +1078,9 @@ function cardHtml(card, i) {
       ? `<div class="gname" title="${esc(card.group_name)}">${esc(card.group_name)}</div>` : "";
     return `<div class="card gstack${sel}" data-i="${i}" data-id="${card.id}">` +
       `${l3}${l2}<div class="gcover">${img}${name}</div>` +
-      `${badge ? `<div class="badge">${badge}</div>` : ""}${score}</div>`;
+      `${badge ? `<div class="badge">${badge}</div>` : ""}${score}${fav}</div>`;
   }
-  return `<div class="card${sel}" data-i="${i}" data-id="${card.id}">${img}${badge ? `<div class="badge">${badge}</div>` : ""}${score}</div>`;
+  return `<div class="card${sel}" data-i="${i}" data-id="${card.id}">${img}${badge ? `<div class="badge">${badge}</div>` : ""}${score}${fav}</div>`;
 }
 
 async function loadMore(reset = false) {
@@ -616,11 +1098,11 @@ async function loadMore(reset = false) {
     state.reachedEnd = true;
     state.lastIndex = null;
     clearSelection();
-    $("gallery").innerHTML = "";
+    galleryClear();
     try {
       const res = await invoke("similar_local_cmd", { fileId: state.similarTo.id, limit: 300 });
       state.cards = res.map((r) => ({ ...r, score: r.similarity / 100 }));
-      $("gallery").innerHTML = state.cards.map((c, k) => cardHtml(c, k)).join("");
+      gallerySet(state.cards.map((c, k) => cardHtml(c, k)).join(""));
       $("statsbar").textContent = `≈ Похожие на арт #${state.similarTo.id} — ${res.length} по релевантности`;
       $("empty-state").classList.toggle("hidden", res.length > 0);
       if (!res.length) {
@@ -641,7 +1123,7 @@ async function loadMore(reset = false) {
     state.cards = [];
     state.lastIndex = null;
     clearSelection();
-    $("gallery").innerHTML = "";
+    galleryClear();
     refreshStats(); // сбрасывает «🧠 …» в обычную статистику
   }
   if (state.reachedEnd) return;
@@ -650,13 +1132,13 @@ async function loadMore(reset = false) {
     const batch = await invoke("query_files", {
       search: state.query, offset: state.offset, limit: state.limit,
       collection: state.collection, nsfw: state.nsfw, recent: state.recent,
+      favorite: state.favOnly, sort: state.sort || null, seed: state.randSeed,
     });
     if (batch.length < state.limit) state.reachedEnd = true;
     state.offset += batch.length;
     const startIdx = state.cards.length;
     state.cards.push(...batch);
-    $("gallery").insertAdjacentHTML("beforeend",
-      batch.map((c, k) => cardHtml(c, startIdx + k)).join(""));
+    galleryAppend(batch.map((c, k) => cardHtml(c, startIdx + k)).join(""));
     queueVideoThumbs(batch);
     const empty = state.cards.length === 0;
     $("empty-state").classList.toggle("hidden", !empty);
@@ -754,7 +1236,7 @@ function captureVideoFrames(src, fracs) {
 // Мультикадровая доиндексация видео силами фронтенда (когда на ПК нет ffmpeg):
 // теги по 3 кадрам вместо одного превью — NSFW из середины ролика не теряется.
 let vfBusy = false;
-async function indexVideoFrames() {
+async function indexVideoFrames(token) {
   if (vfBusy) return;
   let vids = [];
   try { vids = await invoke("list_videos_for_frames"); } catch { return; }
@@ -766,6 +1248,7 @@ async function indexVideoFrames() {
   $("import-cancel").classList.add("hidden");
   let done = 0;
   for (const v of vids) {
+    if (token && token.cancelled) break;
     try {
       const frames = await captureVideoFrames(mediaSrc(v.path), [0.25, 0.5, 0.75]);
       if (frames.length) {
@@ -783,6 +1266,249 @@ async function indexVideoFrames() {
   vfBusy = false;
   refreshStats();
 }
+
+// ---------- Видео → GIF ----------
+// Снимаем кадры видео фронтендом (ffmpeg не нужен), кодирование GIF — в Rust.
+// Возвращает {tooLong} / {skip} / {frames:[png_b64...], delayMs}.
+function captureGif(src, maxSecs, fps, maxDim, onFrame) {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement("video");
+    v.muted = true; v.preload = "auto"; v.crossOrigin = "anonymous";
+    const timer = setTimeout(() => fail(new Error("таймаут видео")), 60000);
+    function cleanup() { clearTimeout(timer); v.removeAttribute("src"); v.load(); }
+    function fail(e) { cleanup(); reject(e); }
+    v.addEventListener("error", () => fail(new Error("видео не декодируется")));
+    const cv = document.createElement("canvas");
+    let times = [], idx = 0, out = [], w = 0, h = 0, delayMs = Math.round(1000 / fps);
+    v.addEventListener("loadedmetadata", () => {
+      const dur = v.duration || 0;
+      if (!dur || !isFinite(dur)) { cleanup(); resolve({ skip: true }); return; }
+      if (dur > maxSecs + 0.05) { cleanup(); resolve({ tooLong: true }); return; }
+      const n = Math.max(2, Math.min(Math.round(dur * fps), 300)); // кадров
+      // Задержка кадра — из реальной длительности, чтобы GIF шёл в темпе видео
+      // (для длинных видео кадров упирается в лимит, темп сохраняем).
+      delayMs = Math.max(20, Math.round((dur * 1000) / n));
+      for (let i = 0; i < n; i++) times.push((dur * i) / n);
+      const scale = Math.min(1, maxDim / Math.max(v.videoWidth, v.videoHeight, 1));
+      w = Math.max(1, Math.round(v.videoWidth * scale));
+      h = Math.max(1, Math.round(v.videoHeight * scale));
+      cv.width = w; cv.height = h;
+      seekNext();
+    });
+    function seekNext() {
+      if (idx >= times.length) {
+        cleanup();
+        resolve({ frames: out, delayMs });
+        return;
+      }
+      try { v.currentTime = Math.max(0.001, times[idx]); } catch (e) { fail(e); }
+    }
+    v.addEventListener("seeked", () => {
+      try {
+        cv.getContext("2d").drawImage(v, 0, 0, w, h);
+        out.push(cv.toDataURL("image/png").split(",")[1]);
+        idx++;
+        if (onFrame) onFrame(idx, times.length);
+        seekNext();
+      } catch (e) { fail(e); }
+    });
+    v.src = src;
+  });
+}
+
+// Токен отмены текущей конвертации (кнопка «Отменить» в тосте).
+let activeGifToken = null;
+
+// Общий проход конвертации набора видео. items: [{id, path}]. maxSecs — порог
+// (Infinity = принудительно, без ограничения длины). token.cancelled — стоп.
+async function convertGifBatch(items, maxSecs, fps, width, replace, token) {
+  token = token || { cancelled: false };
+  activeGifToken = token;
+  const toast = $("import-toast");
+  toast.classList.remove("hidden");
+  toast.querySelector(".toast-title").textContent = "Видео → GIF…";
+  $("import-bar").style.width = "0%";
+  $("import-info").textContent = "Начинаю…";
+  $("import-cancel").classList.remove("hidden"); // конвертацию можно отменить
+  fps = Math.max(5, Math.min(30, fps || 15));
+  const maxDim = Math.max(120, Math.min(960, width || 480));
+  let done = 0, made = 0;
+  for (const v of items) {
+    if (token.cancelled) break;
+    $("import-info").textContent = `Видео ${done + 1} / ${items.length}: снимаю кадры…`;
+    try {
+      const r = await captureGif(mediaSrc(v.path), maxSecs, fps, maxDim, (c, t) => {
+        $("import-info").textContent = `Видео ${done + 1} / ${items.length}: кадр ${c}/${t}`;
+        $("import-bar").style.width =
+          Math.round(((done + c / Math.max(1, t)) / items.length) * 100) + "%";
+      });
+      if (token.cancelled) break;
+      if (r && r.frames && r.frames.length) {
+        $("import-info").textContent = `Видео ${done + 1} / ${items.length}: собираю GIF…`;
+        await invoke("video_to_gif", { fileId: v.id, delayMs: r.delayMs, framesB64: r.frames });
+        made++;
+        if (replace) { try { await invoke("delete_files", { fileIds: [v.id], expandGroups: false }); } catch {} }
+      } else if (maxSecs !== Infinity) {
+        await invoke("mark_gif_done", { fileId: v.id }); // длинное/битое при батче — пропуск
+      }
+    } catch (e) {
+      console.warn("gif:", v.id, e);
+      if (maxSecs !== Infinity) await invoke("mark_gif_done", { fileId: v.id }).catch(() => {});
+    }
+    done++;
+    $("import-bar").style.width = Math.round((done / items.length) * 100) + "%";
+  }
+  $("import-cancel").classList.add("hidden");
+  const cancelled = token.cancelled;
+  activeGifToken = null;
+  $("import-bar").style.width = "100%";
+  $("import-info").textContent = cancelled
+    ? `Отменено. Успело в GIF: ${made}`
+    : `Готово. Конвертировано в GIF: ${made}`;
+  setTimeout(() => toast.classList.add("hidden"), 3500);
+  return made;
+}
+
+// Ставит конвертацию в очередь задач (несколько запусков идут по порядку).
+async function runGifConvert(manual) {
+  if (!manual) {
+    if (TQ.items.some((t) => t.kind === "gif")) return; // авто — не плодим
+    // Авто: не создаём задачу (и не мигаем тостом), если конвертировать нечего.
+    let pend = [];
+    try { pend = await invoke("list_videos_for_gif"); } catch {}
+    if (!pend.length) return;
+  }
+  let redoAll = false;
+  if (manual) {
+    redoAll = !!(await tauriDialog.ask(
+      "Переконвертировать заново и уже обработанные видео (чтобы применить новые настройки качества)?\n\nОК — все заново, Отмена — только новые.",
+      { title: "FurryManager" }));
+  }
+  enqueueTask("Видео → GIF", "gif", async (token) => {
+    if (redoAll) { try { await invoke("reset_gif_done"); } catch {} }
+    let vids = [];
+    try { vids = await invoke("list_videos_for_gif"); } catch {}
+    let made = 0;
+    if (vids.length && !token.cancelled) {
+      made = await convertGifBatch(vids, state.gifSecs || 5, state.gifFps, state.gifWidth, state.gifReplace, token);
+      refreshStats();
+      loadMore(true);
+    }
+    // Индексируем: наследовать теги неоткуда → WD14 разметит сам GIF.
+    if ((made || manual) && !token.cancelled) backgroundIndex();
+  });
+}
+
+// Принудительная конвертация конкретных видео (из ПКМ), без порога длины.
+function forceGifConvert(items, fps, width, replace) {
+  if (!items.length) return;
+  enqueueTask(`Видео → GIF (${items.length})`, "gif", async (token) => {
+    const made = await convertGifBatch(items, Infinity, fps, width, replace, token);
+    refreshStats();
+    loadMore(true);
+    if (made && !token.cancelled) backgroundIndex();
+  });
+}
+
+// ---------- Очередь задач (показывается, когда задач больше одной) ----------
+const TQ = { items: [], running: false, nextId: 1, open: false, current: null };
+
+// Возвращает промис, который резолвится, когда задача завершилась/снята —
+// чтобы вызовы вида `await runIndex()` дожидались конца.
+function enqueueTask(label, kind, run) {
+  let resolveDone;
+  const done = new Promise((res) => { resolveDone = res; });
+  const t = { id: TQ.nextId++, label, kind, status: "pending", token: { cancelled: false }, run, resolveDone };
+  TQ.items.push(t);
+  renderTaskQueue();
+  pumpTaskQueue();
+  return done;
+}
+async function pumpTaskQueue() {
+  if (TQ.running) return;
+  // Снять отменённые pending-задачи (их промисы резолвим).
+  TQ.items = TQ.items.filter((t) => {
+    if (t.status === "pending" && t.token.cancelled) { t.resolveDone(); return false; }
+    return true;
+  });
+  const next = TQ.items.find((t) => t.status === "pending");
+  if (!next) { renderTaskQueue(); return; }
+  TQ.running = true;
+  TQ.current = next;
+  next.status = "running";
+  renderTaskQueue();
+  try { await next.run(next.token); } catch (e) { console.warn("task:", next.label, e); }
+  TQ.items = TQ.items.filter((t) => t.id !== next.id);
+  TQ.current = null;
+  TQ.running = false;
+  next.resolveDone();
+  renderTaskQueue();
+  pumpTaskQueue();
+}
+function cancelTask(id) {
+  const t = TQ.items.find((x) => x.id === id);
+  if (!t) return;
+  t.token.cancelled = true; // выполняющаяся задача остановится сама (проверяет токен)
+  invoke("ai_cancel").catch(() => {}); // если это индексация — тормозим и бэкенд
+  if (t.status === "pending") { TQ.items = TQ.items.filter((x) => x.id !== id); t.resolveDone(); }
+  renderTaskQueue();
+}
+function moveTask(id, dir) {
+  const i = TQ.items.findIndex((t) => t.id === id);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= TQ.items.length) return;
+  if (TQ.items[i].status === "running" || TQ.items[j].status === "running") return; // текущую не двигаем
+  [TQ.items[i], TQ.items[j]] = [TQ.items[j], TQ.items[i]];
+  renderTaskQueue();
+}
+function renderTaskQueue() {
+  const wrap = $("taskq");
+  const n = TQ.items.length;
+  if (n <= 1) { wrap.classList.add("hidden"); TQ.open = false; return; } // «только если больше одной»
+  wrap.classList.remove("hidden");
+  $("taskq-count").textContent = `Задач в очереди: ${n}`;
+  $("taskq-toggle").textContent = TQ.open ? "⌄" : "＾";
+  const list = $("taskq-list");
+  list.classList.toggle("hidden", !TQ.open);
+  list.innerHTML = TQ.items.map((t) => {
+    const run = t.status === "running";
+    return `<div class="tq-row ${run ? "run" : ""}">` +
+      `<span class="tq-label">${run ? "▶ " : ""}${esc(t.label)}</span>` +
+      (run ? "" :
+        `<button class="ghost tq-btn" data-mv="up" data-id="${t.id}" title="Выше">↑</button>` +
+        `<button class="ghost tq-btn" data-mv="down" data-id="${t.id}" title="Ниже">↓</button>`) +
+      `<button class="ghost tq-btn" data-cancel="${t.id}" title="Отменить">✕</button>` +
+      `</div>`;
+  }).join("");
+}
+$("taskq-toggle").addEventListener("click", () => { TQ.open = !TQ.open; renderTaskQueue(); });
+$("taskq-list").addEventListener("click", (e) => {
+  const mv = e.target.closest("[data-mv]");
+  if (mv) return moveTask(Number(mv.dataset.id), mv.dataset.mv === "up" ? -1 : 1);
+  const c = e.target.closest("[data-cancel]");
+  if (c) cancelTask(Number(c.dataset.cancel));
+});
+
+// Окно параметров конвертации выбранных видео в GIF (из ПКМ).
+let gifConvItems = [];
+function openGifConv(items) {
+  if (!items || !items.length) return;
+  gifConvItems = items;
+  $("gifconv-count").textContent = items.length === 1 ? "1 видео" : `Выбрано видео: ${items.length}`;
+  $("gifconv-fps").value = state.gifFps || 15;
+  $("gifconv-width").value = state.gifWidth || 480;
+  $("gifconv-replace").checked = !!state.gifReplace;
+  $("gifconv").classList.remove("hidden");
+}
+$("gifconv-close").addEventListener("click", () => $("gifconv").classList.add("hidden"));
+$("gifconv").addEventListener("click", (e) => { if (e.target === $("gifconv")) $("gifconv").classList.add("hidden"); });
+$("gifconv-go").addEventListener("click", async () => {
+  const fps = Math.max(5, Math.min(30, Number($("gifconv-fps").value) || 15));
+  const width = Math.max(120, Math.min(960, Number($("gifconv-width").value) || 480));
+  const replace = $("gifconv-replace").checked;
+  $("gifconv").classList.add("hidden");
+  await forceGifConvert(gifConvItems, fps, width, replace);
+});
 
 function captureVideoFrame(src) {
   return new Promise((resolve, reject) => {
@@ -1070,13 +1796,48 @@ $("gallery").addEventListener("contextmenu", async (e) => {
       entries.push({ label: "📋 Копировать арт", onClick: () => copyArt(card) });
     }
     entries.push({ label: "📂 Показать в проводнике", onClick: () => revealFile(card.path) });
+    if (state.mode === "artist" && card.kind !== "video") {
+      entries.push({
+        label: "🖼 Открыть поверх окон <span class='cnt'>(референс)</span>",
+        onClick: () => openRefWindow(card),
+      });
+    }
     if (card.group_id && card.group_count > 1) {
       entries.push({ label: `🧩 Редактировать группу (${card.group_count})`, onClick: () => openGroupEditor(card.group_id) });
     }
   }
+  // Избранное: для одного арта — по его состоянию, для выбора — пометить все
+  {
+    const allFav = ids.every((id) => {
+      const c = state.cards.find((x) => x.id === id);
+      return c && c.favorite;
+    });
+    entries.push({
+      label: allFav
+        ? (multi ? `☆ Убрать из избранного (${ids.length})` : "☆ Убрать из избранного")
+        : (multi ? `★ В избранное (${ids.length})` : "★ В избранное"),
+      onClick: () => setFavorite(ids, !allFav),
+    });
+  }
+  // Конвертация видео в GIF (когда функция включена) — для видео в выборе,
+  // без ограничения длины (в отличие от авто-порога).
+  if (state.gifAuto) {
+    const vidItems = ids
+      .map((id) => state.cards.find((c) => c.id === id))
+      .filter((c) => c && c.kind === "video")
+      .map((c) => ({ id: c.id, path: c.path }));
+    if (vidItems.length) {
+      entries.push({
+        label: `🎞 Конвертировать в GIF${vidItems.length > 1 ? ` (${vidItems.length})` : ""}`,
+        onClick: () => openGifConv(vidItems),
+      });
+    }
+  }
   entries.push({ sep: true });
-  if (state.collections.length) {
-    const colEntries = state.collections.map((c) => ({
+  // В режиме скрытия NSFW не показываем NSFW-коллекции и в меню добавления.
+  const visibleCols = state.collections.filter((c) => !(state.hideNsfw && c.is_nsfw));
+  if (visibleCols.length) {
+    const colEntries = visibleCols.map((c) => ({
       label: `📚 ${esc(c.name)}`,
       onClick: async () => {
         try {
@@ -1085,7 +1846,7 @@ $("gallery").addEventListener("contextmenu", async (e) => {
         } catch (err) { alert(err); }
       },
     }));
-    if (state.collections.length > 5) {
+    if (visibleCols.length > 5) {
       // Много коллекций — подменю, а не километровое меню
       entries.push({ label: "📚 Добавить в коллекцию", submenu: colEntries });
     } else {
@@ -1308,7 +2069,7 @@ async function semanticSearch(q) {
   state.offset = 0;
   state.lastIndex = null;
   clearSelection();
-  $("gallery").innerHTML = "";
+  galleryClear();
   $("empty-state").classList.add("hidden");
   $("statsbar").textContent = "🧠 Думаю…";
   try {
@@ -1329,7 +2090,7 @@ function renderSmartResults() {
     : state.smartAll;
   state.cards = res;
   state.lastIndex = null;
-  $("gallery").innerHTML = res.map((c, k) => cardHtml(c, k)).join("");
+  gallerySet(res.map((c, k) => cardHtml(c, k)).join(""));
   $("statsbar").innerHTML =
     `🧠 «${esc(state.query)}» — ${res.length} по релевантности ` +
     `<button id="strict-toggle" class="${state.strict ? "on" : ""}" ` +
@@ -1476,6 +2237,10 @@ $("ai-reindex").addEventListener("click", () => {
   $("ai-menu").classList.add("hidden");
   $("reindex").classList.remove("hidden");
 });
+$("ai-gif").addEventListener("click", () => {
+  $("ai-menu").classList.add("hidden");
+  runGifConvert(true);
+});
 $("reindex-close").addEventListener("click", () => $("reindex").classList.add("hidden"));
 $("reindex").addEventListener("click", (e) => {
   if (e.target === $("reindex")) $("reindex").classList.add("hidden");
@@ -1505,6 +2270,16 @@ $("ai-setup").addEventListener("click", () => {
 });
 
 async function runAiSetup() {
+  // Собранный сайдкар — Python и pip не нужны, установка бессмысленна (и падала
+  // с «program path has no file name», т.к. пути к python нет).
+  try {
+    const s = await invoke("sidecar_status");
+    if (s && s.packaged) {
+      alert("ИИ-компоненты уже встроены — Python устанавливать не нужно. Запускаю индексацию.");
+      runIndex();
+      return;
+    }
+  } catch {}
   $("import-toast").classList.remove("hidden");
   $("import-toast").querySelector(".toast-title").textContent = "Установка ИИ…";
   $("import-bar").style.width = "0%";
@@ -1570,47 +2345,42 @@ listen("ai-setup", (ev) => {
 
 // Фоновая индексация после импорта: обязательно закрываем тост, иначе он
 // «висит» на N/N (событие index-progress показывает его, а закрыть было некому).
-function backgroundIndex() {
-  invoke("ai_index")
-    .then((n) => {
+// Индексация через очередь задач (одна за раз; verbose — подробные сообщения).
+function enqueueIndex(verbose) {
+  if (TQ.items.some((t) => t.kind === "index")) return Promise.resolve(); // уже в очереди
+  return enqueueTask("ИИ-индексация", "index", async (token) => {
+    const toast = $("import-toast");
+    toast.classList.remove("hidden");
+    toast.querySelector(".toast-title").textContent = "Индексирую (ИИ)…";
+    $("import-bar").style.width = "0%";
+    $("import-cancel").classList.remove("hidden");
+    if (verbose) $("import-info").textContent =
+      "Первый запуск скачивает модели (~1 ГБ) — это может занять время, прогресс в консоли.";
+    try {
+      const n = await invoke("ai_index"); // прогресс — через событие index-progress
       if (n) refreshStats();
+      $("import-info").textContent = verbose
+        ? (n > 0 ? `Готово! Проиндексировано: ${n}.` : "Всё уже проиндексировано ✓")
+        : "";
+      $("import-bar").style.width = "100%";
+      if (!token.cancelled) await indexVideoFrames(token);      // видео — по кадрам
+      if (!token.cancelled && state.gifAuto) runGifConvert(false); // затем в GIF (если включено)
+    } catch (e) {
+      $("import-info").textContent = "ИИ: " + e;
+    } finally {
       $("import-cancel").classList.add("hidden");
-      const title = $("import-toast").querySelector(".toast-title");
-      if ((title.textContent || "").startsWith("Индексирую")) {
-        $("import-bar").style.width = "100%";
-        setTimeout(() => $("import-toast").classList.add("hidden"), 2000);
-      }
-      indexVideoFrames(); // новые видео — сразу по кадрам
-    })
-    .catch(() => { $("import-cancel").classList.add("hidden"); });
+      setTimeout(() => $("import-toast").classList.add("hidden"), verbose ? 6000 : 2000);
+    }
+  });
 }
-
-async function runIndex() {
-  $("import-toast").classList.remove("hidden");
-  $("import-toast").querySelector(".toast-title").textContent = "Индексирую (ИИ)…";
-  $("import-bar").style.width = "0%";
-  $("import-cancel").classList.remove("hidden");
-  $("import-info").textContent =
-    "Первый запуск скачивает модели (~1 ГБ) — это может занять время, прогресс в консоли.";
-  try {
-    const n = await invoke("ai_index");
-    $("import-info").textContent = n > 0
-      ? `Готово! Проиндексировано: ${n}. Теперь работает умный поиск (🧠 в строке поиска) и автотеги.`
-      : "Всё уже проиндексировано ✓";
-    $("import-bar").style.width = "100%";
-    setTimeout(() => $("import-toast").classList.add("hidden"), 6000);
-    refreshStats();
-    await indexVideoFrames(); // видео — по 3 кадрам (если ffmpeg нет, снимаем сами)
-  } catch (e) {
-    $("import-info").textContent = "ИИ: " + e;
-  } finally {
-    $("import-cancel").classList.add("hidden");
-  }
-}
+function backgroundIndex() { enqueueIndex(false); }
+function runIndex() { return enqueueIndex(true); }
 
 $("import-cancel").addEventListener("click", () => {
+  if (TQ.current) TQ.current.token.cancelled = true; // текущая задача очереди
+  if (activeGifToken) activeGifToken.cancelled = true;
   invoke("ai_cancel").catch(() => {});
-  $("import-info").textContent = "Останавливаю после текущей пачки…";
+  $("import-info").textContent = "Останавливаю после текущего шага…";
 });
 
 listen("index-progress", (ev) => {
@@ -1664,6 +2434,7 @@ function renderViewerMedia(card) {
     media.innerHTML = `<img src="${mediaSrc(card.path)}" alt="" />`;
   }
   resetZoom(); // новый арт — сбрасываем зум и пипетку
+  updateViewerFav(); // ★ показываем состояние открытого арта
 }
 
 async function loadViewerDetails(card) {
@@ -1678,7 +2449,7 @@ async function loadViewerDetails(card) {
     const dims = d.width ? `${d.width}×${d.height} · ` : "";
     const artist = d.sources[0] && d.sources[0].artist ? `автор: ${d.sources[0].artist} · ` : "";
     let info = `${artist}${dims}${d.ext.toUpperCase()} · ${fmtBytes(d.size)}`;
-    if (state.mode === "advanced") info += `\nsha256: ${d.sha256.slice(0, 16)}…`;
+    if (state.mode !== "simple") info += `\nsha256: ${d.sha256.slice(0, 16)}…`;
     $("v-info").textContent = info;
     renderTags(d.tags);
     state.viewerCollections = d.collections || [];
@@ -1739,13 +2510,19 @@ function closeViewer() {
 }
 
 // ---------- Зум и пипетка ----------
-const zoom = { scale: 1, x: 0, y: 0, panning: false, sx: 0, sy: 0, pipette: false, bitmap: null };
+// flip/rot — инструменты художника: зеркало для проверки композиции и поворот.
+const zoom = { scale: 1, x: 0, y: 0, panning: false, sx: 0, sy: 0, pipette: false,
+               bitmap: null, flip: false, rot: 0 };
 
 function viewerImg() { return $("viewer-media").querySelector("img"); }
 
 function applyZoom() {
   const el = viewerImg();
-  if (el) el.style.transform = `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.scale})`;
+  if (el) {
+    el.style.transform =
+      `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.scale}) ` +
+      `rotate(${zoom.rot}deg) scaleX(${zoom.flip ? -1 : 1})`;
+  }
   $("viewer-media").style.cursor =
     zoom.pipette ? "crosshair" : zoom.scale !== 1 ? "grab" : "";
 }
@@ -1753,6 +2530,7 @@ function applyZoom() {
 function resetZoom() {
   zoom.scale = 1; zoom.x = 0; zoom.y = 0;
   zoom.pipette = false; zoom.bitmap = null; zoom.panning = false;
+  zoom.flip = false; zoom.rot = 0;
   applyZoom();
 }
 
@@ -1841,6 +2619,80 @@ async function pickColor(e) {
   }
 }
 
+// Сетка построения поверх арта (правило третей) — инструмент художника.
+function gridOverlayOn() { return $("viewer-media").classList.contains("grid3"); }
+function toggleGridOverlay() { $("viewer-media").classList.toggle("grid3"); }
+
+// Окно поверх других — чтобы держать референс рядом с редактором.
+let onTop = false;
+async function toggleAlwaysOnTop() {
+  try {
+    const w = window.__TAURI__.window.getCurrentWindow();
+    onTop = !onTop;
+    await w.setAlwaysOnTop(onTop);
+    $("btn-ontop").classList.toggle("active", onTop);
+    $("btn-ontop").title = onTop
+      ? "Окно поверх других: включено — кликни, чтобы выключить"
+      : "Окно поверх других (удобно рисовать рядом)";
+    // Видимый признак режима: рамка вокруг окна + подсказка, как выключить
+    document.body.classList.toggle("ontop", onTop);
+    $("ontop-hint").classList.toggle("hidden", !onTop);
+  } catch (e) {
+    onTop = false;
+    alert("Не удалось закрепить окно: " + e);
+  }
+}
+$("btn-ontop").addEventListener("click", toggleAlwaysOnTop);
+$("ontop-off").addEventListener("click", toggleAlwaysOnTop);
+
+// Отдельное окошко только с артом — поверх других окон. Художнику обычно нужен
+// именно реф под рукой, а не весь менеджер поверх редактора.
+async function openRefWindow(card) {
+  if (!card) return;
+  try {
+    const { WebviewWindow } = window.__TAURI__.webviewWindow;
+    // Одно окно рефа за раз: старое закрываем
+    try {
+      const prev = await WebviewWindow.getByLabel("ref");
+      if (prev) await prev.close();
+    } catch {}
+    const src = encodeURIComponent(mediaSrc(card.path));
+    const name = encodeURIComponent((card.path || "").split(/[\\/]/).pop() || "");
+    const path = encodeURIComponent(card.path || "");
+    const w = new WebviewWindow("ref", {
+      url: `ref.html?src=${src}&name=${name}&path=${path}&id=${card.id}`,
+      title: "Референс — поверх других окон",
+      width: 460, height: 620,
+      alwaysOnTop: true,
+      resizable: true,
+      decorations: true,
+    });
+    w.once("tauri://error", (ev) => {
+      alert("Не удалось открыть окно референса: " + JSON.stringify(ev && ev.payload));
+    });
+  } catch (e) {
+    alert("Окно референса: " + e);
+  }
+}
+
+// Из окна референса попросили показать арт в менеджере — открываем и фокусируем
+listen("ref-locate", async (ev) => {
+  const id = ev.payload && ev.payload.id;
+  if (!id) return;
+  try {
+    const w = window.__TAURI__.window.getCurrentWindow();
+    await w.unminimize().catch(() => {});
+    await w.setFocus().catch(() => {});
+  } catch {}
+  try {
+    const [brief] = await invoke("files_brief", { ids: [id] });
+    if (!brief) { alert("Этот арт уже удалён из библиотеки."); return; }
+    const idx = state.cards.findIndex((c) => c.id === id);
+    if (idx >= 0) openViewer(idx); // есть в ленте — открываем прямо там
+    else openVirtual([brief], 0, "Из окна референса");
+  } catch (e) { alert(e); }
+});
+
 // ПКМ в просмотрщике: зум, пипетка, удаление
 $("viewer-media").addEventListener("contextmenu", (e) => {
   e.preventDefault();
@@ -1850,11 +2702,34 @@ $("viewer-media").addEventListener("contextmenu", (e) => {
     entries.push({ label: "🔍 Приблизить <span class='cnt'>(колесо мыши)</span>", onClick: () => { zoom.scale = Math.min(12, zoom.scale * 1.5); applyZoom(); } });
     entries.push({ label: "🔎 Отдалить", onClick: () => { zoom.scale = Math.max(0.2, zoom.scale / 1.5); applyZoom(); } });
     entries.push({ label: "↩ Как было <span class='cnt'>(двойной клик)</span>", onClick: resetZoom });
-    entries.push({ sep: true });
-    entries.push({
-      label: zoom.pipette ? "🎨 Выключить пипетку" : "🎨 Пипетка — кликни по цвету",
-      onClick: () => { zoom.pipette = !zoom.pipette; applyZoom(); },
-    });
+    // Инструменты художника — только в режиме «Художник»
+    if (state.mode === "artist") {
+      entries.push({ sep: true });
+      entries.push({
+        label: zoom.pipette ? "🎨 Выключить пипетку" : "🎨 Пипетка — кликни по цвету",
+        onClick: () => { zoom.pipette = !zoom.pipette; applyZoom(); },
+      });
+      entries.push({
+        label: zoom.flip ? "🪞 Убрать зеркало" : "🪞 Зеркало <span class='cnt'>(проверить композицию)</span>",
+        onClick: () => { zoom.flip = !zoom.flip; applyZoom(); },
+      });
+      entries.push({
+        label: "⟳ Повернуть на 90°",
+        onClick: () => { zoom.rot = (zoom.rot + 90) % 360; applyZoom(); },
+      });
+      entries.push({
+        label: gridOverlayOn() ? "▦ Убрать сетку" : "▦ Сетка построения (трети)",
+        onClick: toggleGridOverlay,
+      });
+      entries.push({
+        label: "🖼 Открыть арт поверх окон <span class='cnt'>(отдельным окном)</span>",
+        onClick: () => openRefWindow(viewerCard()),
+      });
+      entries.push({
+        label: onTop ? "🔝 Не держать менеджер поверх" : "🔝 Весь менеджер поверх окон",
+        onClick: toggleAlwaysOnTop,
+      });
+    }
     entries.push({ sep: true });
   }
   const card = viewerCard();
@@ -1886,7 +2761,7 @@ function renderTags(tags) {
   $("v-tags").innerHTML = tags.length
     ? tags.map((t) =>
         `<span class="chip" data-id="${t.id}" data-ns="${esc(t.namespace)}" data-name="${esc(t.name)}">` +
-        (t.namespace && state.mode === "advanced" ? `<span class="ns">${esc(t.namespace)}:</span>` : "") +
+        (t.namespace && state.mode !== "simple" ? `<span class="ns">${esc(t.namespace)}:</span>` : "") +
         `${esc(t.name)}<span class="x" title="Убрать тег">✕</span></span>`
       ).join("")
     : `<span class="muted small">Тегов пока нет — добавь первый!</span>`;
@@ -2004,12 +2879,14 @@ function renderViewerCollections() {
     el.innerHTML = `<span class="muted small">Коллекций пока нет — создай первую в панели под поиском (＋ Новая).</span>`;
     return;
   }
-  el.innerHTML = state.collections.map((c) => {
-    const inCol = state.viewerCollections.includes(c.id);
-    const hint = inCol ? "Убрать из коллекции" : "Добавить в коллекцию";
-    const mark = inCol ? "✓ " : "";
-    return `<span class="chip ${inCol ? "incol" : ""}" data-col="${c.id}" title="${hint}">${mark}${esc(c.name)}</span>`;
-  }).join("");
+  el.innerHTML = state.collections
+    .filter((c) => !(state.hideNsfw && c.is_nsfw)) // в режиме скрытия — без NSFW-коллекций
+    .map((c) => {
+      const inCol = state.viewerCollections.includes(c.id);
+      const hint = inCol ? "Убрать из коллекции" : "Добавить в коллекцию";
+      const mark = inCol ? "✓ " : "";
+      return `<span class="chip ${inCol ? "incol" : ""}" data-col="${c.id}" title="${hint}">${mark}${esc(c.name)}</span>`;
+    }).join("");
 }
 
 $("v-collections").addEventListener("click", async (e) => {
@@ -2124,6 +3001,70 @@ $("sim-results").addEventListener("contextmenu", async (e) => {
   showCtxMenu(e.clientX, e.clientY, entries);
 });
 
+// Вид файла по расширению (там, где под рукой нет kind из базы).
+function kindFromExt(ext) {
+  const e = String(ext || "").toLowerCase().replace(/^\./, "");
+  if (["mp4", "webm", "mov", "mkv", "avi", "m4v"].includes(e)) return "video";
+  if (e === "gif") return "animation";
+  return "image";
+}
+
+// Стандартное контекст-меню для арта по объекту {id, path, kind}: открыть,
+// копировать, показать в проводнике, удалить. Для модалок, где карточки из
+// ленты нет (Дубликаты, Предложить группы). afterDelete — что перерисовать.
+function showItemCtx(x, y, item, afterDelete) {
+  const entries = [{
+    label: "👁 Открыть",
+    onClick: () => {
+      // Просмотрщик (z-50) ниже модалок (z-70) — прячем модалку, иначе не видно.
+      $("dupes").classList.add("hidden");
+      $("autogroups").classList.add("hidden");
+      openVirtual([item], 0, "Просмотр");
+    },
+  }];
+  if (item.kind !== "video") {
+    entries.push({ label: "📋 Копировать арт", onClick: () => copyArt(item) });
+  }
+  entries.push({ label: "📂 Показать в проводнике", onClick: () => revealFile(item.path) });
+  entries.push({ sep: true });
+  entries.push({
+    label: "🗑 Удалить из библиотеки",
+    onClick: async () => { await deleteFiles([item.id]); if (afterDelete) afterDelete(); },
+  });
+  showCtxMenu(x, y, entries);
+}
+
+// ПКМ по арту в модалке «Дубликаты» (все данные уже под рукой в dupeGroups)
+$("dupes-list").addEventListener("contextmenu", (e) => {
+  const el = e.target.closest(".dupe-item[data-id]");
+  if (!el) return;
+  e.preventDefault();
+  const id = Number(el.dataset.id);
+  let file = null;
+  for (const g of dupeGroups) {
+    const f = g.files.find((x) => x.id === id);
+    if (f) { file = f; break; }
+  }
+  if (!file) return;
+  const item = { id, path: file.path, thumb: file.thumb, kind: kindFromExt(file.ext) };
+  showItemCtx(e.clientX, e.clientY, item, () => scanDupes());
+});
+
+// ПКМ по миниатюре в «Предложить группы» — путь/вид тянем с бэкенда по id
+$("ag-list").addEventListener("contextmenu", async (e) => {
+  const img = e.target.closest("img.ag-th[data-fid]");
+  if (!img) return;
+  e.preventDefault();
+  const fid = Number(img.dataset.fid);
+  let brief;
+  try {
+    brief = (await invoke("files_brief", { ids: [fid] }))[0];
+  } catch (err) { return alert(err); }
+  if (!brief) return;
+  // После удаления пересобираем предложения (арт исчез из библиотеки)
+  showItemCtx(e.clientX, e.clientY, brief, () => $("dupe-autogroup").click());
+});
+
 $("btn-sim-web").addEventListener("click", async () => {
   const card = viewerCard();
   if (!card) return;
@@ -2220,6 +3161,8 @@ document.addEventListener("keydown", (e) => {
   }
   if (e.key === "Escape") {
     if (!$("ctx-menu").classList.contains("hidden")) hideCtxMenu();
+    else if (!$("trash").classList.contains("hidden")) $("trash").classList.add("hidden");
+    else if (!$("gifconv").classList.contains("hidden")) $("gifconv").classList.add("hidden");
     else if (!$("health").classList.contains("hidden")) $("health").classList.add("hidden");
     else if (!$("groupedit").classList.contains("hidden")) $("groupedit").classList.add("hidden");
     else if (!$("autogroups").classList.contains("hidden")) $("autogroups").classList.add("hidden");
@@ -2236,6 +3179,21 @@ document.addEventListener("keydown", (e) => {
   } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "A" || e.key === "a" || e.key === "Ф" || e.key === "ф")) {
     e.preventDefault();
     selectAllVisible(); // работает и на русской раскладке
+  } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.code === "KeyH")) {
+    e.preventDefault();
+    toggleHideNsfw(); // тотальное скрытие NSFW (Ctrl+Shift+H, любая раскладка)
+  } else if (!e.ctrlKey && !e.metaKey && !e.altKey && e.code === "KeyF") {
+    // F — переключить ★ у открытого арта или у выделенных
+    const ids = state.selected.size ? [...state.selected]
+      : (viewerCard() ? [viewerCard().id] : []);
+    if (ids.length) {
+      e.preventDefault();
+      const allFav = ids.every((id) => {
+        const c = state.cards.find((x) => x.id === id);
+        return c && c.favorite;
+      });
+      setFavorite(ids, !allFav);
+    }
   } else if (e.key === "/") {
     e.preventDefault();
     $("search").focus();
@@ -2430,6 +3388,10 @@ function healthJump(query, recent = false) {
   state.recent = recent;
   state.collection = null;
   state.similarTo = null;
+  // Счётчики здоровья не учитывают SFW/NSFW-фильтр — показываем все рейтинги,
+  // иначе «5 без коллекций», а по «показать» пусто (арты оказались NSFW при
+  // активном SFW). В режиме тотального скрытия остаёмся на SFW.
+  if (!state.hideNsfw) state.nsfw = null;
   renderSimilarChip();
   $("search").value = query;
   renderCollectionsBar();
@@ -3164,9 +4126,37 @@ $("ob-finish").addEventListener("click", async () => {
 });
 
 // ---------- Старт ----------
-(async function init() {
-  const setup = await invoke("get_setup_state");
-  applyMode(setup.mode || "basic");
+// Аварийный экран старта вместо «белизны».
+function showBootError(html) {
+  $("boot-error-msg").innerHTML = html;
+  $("boot-error").classList.remove("hidden");
+}
+$("boot-retry").addEventListener("click", () => location.reload());
+$("boot-pick").addEventListener("click", async () => {
+  try {
+    if (await chooseLibraryFolder("Укажи папку библиотеки")) location.reload();
+  } catch (e) { alert(e); }
+});
+// Ограничитель ожидания: недоступная библиотека (сетевой/внешний диск) может
+// отвечать десятки секунд — не ждём молча с белым экраном.
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(label || "timeout")), ms)),
+  ]);
+}
+
+async function boot() {
+  // Визуальные настройки — до запроса к бэкенду, чтобы не мигало темой
+  applyDisplay(loadDisplay());
+  try { state.sort = localStorage.getItem("fm_sort") || null; } catch {}
+  if (state.sort) $("sort-select").value = state.sort;
+  if (state.sort === "random") newRandSeed();
+  updateSortUi();
+  const setup = await withTimeout(
+    invoke("get_setup_state"), 8000, "Библиотека долго не отвечает"
+  );
+  applyMode(setup.mode || "simple");
   state.nsfwSplit = !!setup.nsfw_split;
   state.lossless = !!setup.lossless;
   state.lan = !!setup.lan;
@@ -3185,6 +4175,15 @@ $("ob-finish").addEventListener("click", async () => {
   }
   state.defaultNsfw = setup.default_nsfw ?? null;
   if (state.nsfwSplit) state.nsfw = state.defaultNsfw; // фильтр при запуске
+  state.hideNsfw = !!setup.hide_nsfw;
+  if (state.hideNsfw) state.nsfw = 0; // режим скрытия — залочено на SFW
+  state.gifAuto = !!setup.video_gif;
+  state.gifSecs = setup.video_gif_secs || 5;
+  state.gifReplace = !!setup.video_gif_replace;
+  state.gifFps = setup.video_gif_fps || 15;
+  state.gifWidth = setup.video_gif_width || 480;
+  state.useTrash = setup.use_trash !== false;
+  state.trashDays = setup.trash_days ?? 30;
   state.httpToken = setup.http_token;
   state.httpPort = setup.http_port;
   state.ready = true; // фильтры установлены — можно грузить галерею
@@ -3213,5 +4212,20 @@ $("ob-finish").addEventListener("click", async () => {
     let seen = false;
     try { seen = localStorage.getItem("fm_guide_seen") === "1"; } catch {}
     if (!seen) showGuide();
+  }
+}
+
+(async function init() {
+  try {
+    await boot();
+  } catch (e) {
+    console.error("boot failed:", e);
+    showBootError(
+      "Не удалось загрузить библиотеку.<br><br>" +
+      "Скорее всего, папка с библиотекой сейчас недоступна — внешний или сетевой " +
+      "диск не подключён, либо компьютер с библиотекой выключен. Все арты и теги " +
+      "лежат в этой папке; как только она снова доступна, всё вернётся на место.<br><br>" +
+      "<span class=\"small\">" + esc(String((e && e.message) || e)) + "</span>"
+    );
   }
 })();

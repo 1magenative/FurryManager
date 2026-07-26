@@ -8,6 +8,7 @@ mod import;
 mod server;
 mod sidecar;
 mod similar;
+mod tg;
 mod watcher;
 
 use commands::{AiState, AppState};
@@ -36,12 +37,31 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 fn main() {
-    // Если библиотека уже настроена — открываем базу сразу.
+    // Если библиотека уже настроена — открываем базу сразу, но с таймаутом:
+    // на отключённом сетевом/внешнем диске db::open висит на таймауте ОС и
+    // подвесил бы весь запуск (окно так и не появится — «белый экран»).
+    // Не открылось за 3с — стартуем без соединения (команды вернут понятную
+    // ошибку, а окно загрузится и покажет экран «папка недоступна»).
     let cfg = commands::load_config();
     let root: Option<PathBuf> = cfg.library_root.as_ref().map(PathBuf::from);
-    let conn = root
-        .as_ref()
-        .and_then(|r| db::open(&r.join("library.db")).ok());
+    // Приватность: прячем внутренние папки от Проводника/поиска Windows.
+    // Плюс чистим корзину от старья (в фоне — трогает диск).
+    if let Some(r) = &root {
+        commands::harden_library(r);
+        let r2 = r.clone();
+        let days = cfg.trash_days.unwrap_or(30);
+        std::thread::spawn(move || commands::trash_purge_old(&r2, days));
+    }
+    let conn = root.as_ref().and_then(|r| {
+        let path = r.join("library.db");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(db::open(&path).ok());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(3))
+            .ok()
+            .flatten()
+    });
 
     let (http_port, http_token) = commands::ensure_http_credentials();
     let lan = cfg.lan.unwrap_or(false);
@@ -65,6 +85,7 @@ fn main() {
             // Наблюдение за папками из конфига + первичный скан.
             let ws = app.state::<watcher::WatchState>();
             watcher::init(&handle, ws.inner());
+            tg::start_if_enabled(handle.clone()); // Telegram-бот-загрузчик, если включён
             #[cfg(windows)]
             start_lock_watcher(handle.clone());
             Ok(())
@@ -149,6 +170,26 @@ fn main() {
             commands::remove_watched,
             commands::save_video_thumb,
             commands::semantic_search,
+            commands::files_brief,
+            commands::ts_status,
+            commands::ts_serve_enable,
+            commands::ts_serve_disable,
+            commands::set_collection_nsfw,
+            commands::set_hide_nsfw,
+            tg::tg_enable,
+            tg::tg_disable,
+            tg::tg_status,
+            commands::set_favorite,
+            commands::trash_list,
+            commands::trash_count,
+            commands::trash_restore,
+            commands::trash_purge,
+            commands::set_trash_settings,
+            commands::set_gif_settings,
+            commands::list_videos_for_gif,
+            commands::mark_gif_done,
+            commands::reset_gif_done,
+            commands::video_to_gif,
         ])
         .run(tauri::generate_context!())
         .expect("Не удалось запустить приложение");

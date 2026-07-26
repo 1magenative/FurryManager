@@ -12,6 +12,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// Мобильная страница (PWA) и её иконка — вшиты в бинарник.
 const PWA_HTML: &str = include_str!("../pwa/index.html");
 const PWA_ICON: &[u8] = include_bytes!("../icons/pwa-icon.png"); // непрозрачная: iOS красит альфу в чёрный
+const PWA_SW: &str = include_str!("../pwa/sw.js"); // Service Worker: офлайн-запуск (нужен https через Tailscale)
 
 pub fn start(app: AppHandle, port: u16, token: String, lan: bool) {
     std::thread::spawn(move || {
@@ -91,6 +92,23 @@ pub fn start(app: AppHandle, port: u16, token: String, lan: bool) {
                         let resp = tiny_http::Response::from_data(PWA_ICON.to_vec()).with_header(
                             tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap(),
                         );
+                        let _ = request.respond(resp);
+                        continue;
+                    }
+                    "/sw.js" => {
+                        // Service Worker: no-cache, чтобы обновление подхватывалось.
+                        // Токен не нужен — скрипт не выдаёт данные.
+                        let resp = tiny_http::Response::from_string(PWA_SW)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    "Content-Type",
+                                    "application/javascript; charset=utf-8",
+                                )
+                                .unwrap(),
+                            )
+                            .with_header(
+                                tiny_http::Header::from_bytes("Cache-Control", "no-cache").unwrap(),
+                            );
                         let _ = request.respond(resp);
                         continue;
                     }

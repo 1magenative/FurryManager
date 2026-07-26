@@ -1,9 +1,9 @@
 # FurryManager 🦊
 
-Локальный менеджер артов и референсов для Windows: теги вместо папок, коллекции
-и группы, умный поиск нейросетью, скачивание из браузера в один клик и доступ
-с телефона. **Всё хранится и обрабатывается на вашем компьютере** — без облака,
-аккаунтов и аналитики.
+Локальный менеджер артов и референсов для **Windows и Linux**: теги вместо
+папок, коллекции и группы, умный поиск нейросетью, скачивание из браузера в
+один клик и доступ с телефона. **Всё хранится и обрабатывается на вашем
+компьютере** — без облака, аккаунтов и аналитики.
 
 ## Возможности
 
@@ -38,8 +38,27 @@
 
 ## Установка
 
-Скачайте установщик со страницы [Releases](../../releases) и запустите.
-Права администратора не нужны, Python ставить не надо — ИИ-модуль внутри.
+**Windows.** Скачайте установщик со страницы [Releases](../../releases) и
+запустите. Права администратора не нужны, Python ставить не надо — ИИ-модуль
+внутри.
+
+**Linux (Ubuntu 22.04+).** Скачайте `.deb` или AppImage со страницы
+[Releases](../../releases):
+
+```bash
+sudo apt install ./FurryManager_0.6.0_amd64.deb
+# либо
+chmod +x FurryManager_0.6.0_amd64.AppImage && ./FurryManager_0.6.0_amd64.AppImage
+```
+
+Для видео (превью, индексация, конвертация в GIF) в Linux нужны кодеки —
+вебвью там их не содержит:
+
+```bash
+sudo apt install gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+  gstreamer1.0-plugins-ugly gstreamer1.0-libav
+```
+
 При первом запуске приложение спросит, где хранить библиотеку, и проведёт
 короткий тур.
 
@@ -53,17 +72,26 @@
 
 ## Сборка из исходников
 
-Нужны: Rust (MSVC-тулчейн), VS Build Tools, WebView2, `cargo install tauri-cli`.
-Для сборки ИИ-модуля дополнительно Python 3.11+.
+Подробно — в [SETUP.md](SETUP.md). Коротко:
+
+**Windows.** Rust (MSVC-тулчейн), VS Build Tools, WebView2,
+`cargo install tauri-cli`; для ИИ-модуля — Python 3.11+.
 
 ```powershell
-cargo tauri dev     # запуск в режиме разработки
+cargo tauri dev                                            # разработка
+powershell -ExecutionPolicy Bypass -File release.ps1       # установщик
 ```
 
-Установщик одной командой (соберёт и ИИ-модуль):
+**Linux.** Системные библиотеки и Rust:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File release.ps1
+```bash
+sudo apt install -y build-essential curl wget file libssl-dev \
+  libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libxdo-dev \
+  libayatana-appindicator3-dev pkg-config
+cargo install tauri-cli --locked
+
+cargo tauri dev          # разработка
+bash release.sh          # .deb и AppImage
 ```
 
 ## Документация
@@ -82,6 +110,12 @@ src-tauri/   — Rust-бэкенд (Tauri 2, SQLite); pwa/ — мобильна�
 sidecar/     — Python-модуль: CLIP, WD14-теггер, gallery-dl
 extension/   — расширение для Chrome (MV3)
 ```
+
+## Лицензия
+
+[MIT](LICENSE) — можно свободно использовать, изменять и распространять,
+сохранив копирайт. Библиотеки со своими лицензиями (Tauri, gallery-dl, модели
+CLIP и WD14) остаются под своими.
 
 ## Технологии
 

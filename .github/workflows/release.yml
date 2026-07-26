@@ -1,10 +1,10 @@
-# Сборка установщика при публикации тега (например: git tag v0.5.0 && git push --tags).
-# Готовый setup.exe прикрепляется к черновику релиза на GitHub.
+# Сборка пакетов при публикации тега (например: git tag v0.6.0 && git push --tags).
+# Готовые файлы прикрепляются к черновику релиза на GitHub.
 #
 # ВАЖНО: ИИ-сайдкар здесь НЕ собирается (PyInstaller + onnxruntime дают
-# ~500 МБ и долгую сборку). Установщик из этого workflow требует у
-# пользователя Python для ИИ-функций. Для «полного» релиза собирайте
-# локально через release.ps1 и прикладывайте файл к релизу вручную.
+# ~500 МБ и долгую сборку). Пакеты из этого workflow требуют у пользователя
+# Python для ИИ-функций. Для «полного» релиза собирайте локально
+# (release.ps1 в Windows, release.sh в Linux) и прикладывайте файлы вручную.
 
 name: build-installer
 
@@ -15,7 +15,19 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+            artifacts: src-tauri/target/release/bundle/nsis/*setup.exe
+          - os: ubuntu-latest
+            name: linux
+            artifacts: |
+              src-tauri/target/release/bundle/deb/*.deb
+              src-tauri/target/release/bundle/appimage/*.AppImage
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
 
@@ -24,6 +36,15 @@ jobs:
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      # Системные библиотеки Tauri (только Linux)
+      - name: Linux deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            librsvg2-dev libxdo-dev libayatana-appindicator3-dev \
+            build-essential curl wget file libssl-dev pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -38,27 +59,27 @@ jobs:
         run: cargo install tauri-cli --locked
 
       # Сайдкар здесь не собирается, но папка-ресурс должна существовать,
-      # иначе build.rs падает: resource path `..\sidecar\dist` doesn't exist.
+      # иначе build.rs падает: resource path `../sidecar/dist` doesn't exist.
       - name: Ensure sidecar resource dir
-        shell: pwsh
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path sidecar/dist | Out-Null
-          if (-not (Get-ChildItem sidecar/dist -Force)) {
-            Set-Content sidecar/dist/PLACEHOLDER.txt "No packaged sidecar in CI builds; AI features go through Python."
-          }
+          mkdir -p sidecar/dist
+          [ -n "$(ls -A sidecar/dist)" ] || \
+            echo "No packaged sidecar in CI builds; AI features go through Python." \
+            > sidecar/dist/PLACEHOLDER.txt
 
-      - name: Build installer
+      - name: Build
         run: cargo tauri build
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FurryManager-setup
-          path: src-tauri/target/release/bundle/nsis/*setup.exe
+          name: FurryManager-${{ matrix.name }}
+          path: ${{ matrix.artifacts }}
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          files: src-tauri/target/release/bundle/nsis/*setup.exe
+          files: ${{ matrix.artifacts }}

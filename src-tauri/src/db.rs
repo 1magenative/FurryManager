@@ -94,6 +94,21 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             created_at INTEGER NOT NULL
         );
 
+        -- Корзина: удалённые арты живут здесь до окончательной очистки.
+        -- Сам файл переносится в <библиотека>/trash/, метаданные (теги,
+        -- коллекции, источники, рейтинг) сохраняются в meta как JSON.
+        CREATE TABLE IF NOT EXISTS trash (
+            id         INTEGER PRIMARY KEY,
+            sha256     TEXT NOT NULL,
+            ext        TEXT NOT NULL,
+            kind       TEXT NOT NULL DEFAULT 'image',
+            trash_rel  TEXT,           -- trash/<sha>.<ext>; NULL для in-place
+            orig_rel   TEXT NOT NULL,  -- где лежал раньше (для in-place — абс. путь)
+            storage    TEXT NOT NULL DEFAULT 'store',
+            meta       TEXT NOT NULL DEFAULT '{}',
+            deleted_at INTEGER NOT NULL
+        );
+
         -- Связи тегов: implies (parent подразумевает child) и alias (синонимы).
         CREATE TABLE IF NOT EXISTS tag_relations (
             id        INTEGER PRIMARY KEY,
@@ -110,6 +125,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     let _ = conn.execute("ALTER TABLE files ADD COLUMN nsfw INTEGER", []);
     // порядок коллекций в панели
     let _ = conn.execute("ALTER TABLE collections ADD COLUMN position INTEGER", []);
+    // рейтинг коллекции: NULL=авто (по содержимому), 0=SFW, 1=NSFW
+    let _ = conn.execute("ALTER TABLE collections ADD COLUMN nsfw INTEGER", []);
     // способ хранения файла: 'store' (копия в библиотеке) | 'inplace' (оригинал на месте)
     let _ = conn.execute("ALTER TABLE files ADD COLUMN storage TEXT DEFAULT 'store'", []);
     // история просмотров
@@ -118,6 +135,11 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_files_viewed ON files(viewed_at)", []);
     // видео прошло мультикадровую индексацию (3 кадра), а не по одному превью
     let _ = conn.execute("ALTER TABLE files ADD COLUMN vframes INTEGER", []);
+    // видео уже обработано конвертером в GIF (1 = сделано/пропущено)
+    let _ = conn.execute("ALTER TABLE files ADD COLUMN gif_done INTEGER", []);
+    // избранное (★)
+    let _ = conn.execute("ALTER TABLE files ADD COLUMN favorite INTEGER DEFAULT 0", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_files_fav ON files(favorite)", []);
     // членство в группе (комикс/вариации) и позиция внутри неё
     let _ = conn.execute("ALTER TABLE files ADD COLUMN group_id INTEGER", []);
     let _ = conn.execute("ALTER TABLE files ADD COLUMN group_pos INTEGER", []);

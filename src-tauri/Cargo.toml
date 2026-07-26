@@ -1,6 +1,6 @@
 [package]
 name = "furrymanager"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Локальный менеджер фурри-артов и референсов"
 
@@ -19,7 +19,7 @@ sha2 = "0.10"
 hex = "0.4"
 walkdir = "2"
 image = { version = "0.24", features = ["webp"] }
-reqwest = { version = "0.12", features = ["multipart", "json"] }
+reqwest = { version = "0.12", features = ["multipart", "json", "blocking"] }
 dirs = "5"
 tiny_http = "0.12"
 base64 = "0.22"
@@ -29,7 +29,7 @@ md-5 = "0.10"
 zip = { version = "0.6", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [profile.release]
 lto = true
