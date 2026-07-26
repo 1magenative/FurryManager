@@ -42,7 +42,9 @@ if [ -n "$MISSING" ]; then
 fi
 
 echo "== Сборка приложения и пакетов =="
-cargo tauri build
+# Цели задаём здесь, а не в tauri.conf.json: там стоит nsis (для Windows),
+# а «all» на Windows потянул бы ещё и MSI, которому нужен WiX.
+cargo tauri build --bundles deb,appimage
 
 echo
 echo "== Готово =="

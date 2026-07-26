@@ -21,9 +21,11 @@ jobs:
         include:
           - os: windows-latest
             name: windows
+            bundles: nsis
             artifacts: src-tauri/target/release/bundle/nsis/*setup.exe
           - os: ubuntu-latest
             name: linux
+            bundles: deb,appimage
             artifacts: |
               src-tauri/target/release/bundle/deb/*.deb
               src-tauri/target/release/bundle/appimage/*.AppImage
@@ -69,7 +71,7 @@ jobs:
             > sidecar/dist/PLACEHOLDER.txt
 
       - name: Build
-        run: cargo tauri build
+        run: cargo tauri build --bundles ${{ matrix.bundles }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

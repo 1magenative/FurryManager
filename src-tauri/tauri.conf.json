@@ -29,8 +29,8 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "category": "Graphics",
+    "targets": ["nsis"],
+    "category": "Graphics and Design",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
     "publisher": "FurryManager",
     "shortDescription": "Локальный менеджер артов",
