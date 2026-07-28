@@ -271,6 +271,41 @@ pub fn tg_disable() -> Result<(), String> {
     save_config(&c)
 }
 
+/// Разовая выборка новых сообщений — для режима тихой синхронизации.
+/// Без AppHandle: событий в интерфейс слать некому, окна нет.
+pub fn sync_once() -> usize {
+    let cfg = load_config();
+    if !cfg.tg_bot.unwrap_or(false) {
+        return 0;
+    }
+    let token = match cfg.tg_token {
+        Some(t) if !t.is_empty() => t,
+        _ => return 0,
+    };
+    let Some(cl) = client() else { return 0 };
+    let offset = cfg.tg_offset.unwrap_or(0);
+    let Ok(updates) = get_updates(&cl, &token, offset) else { return 0 };
+    let mut added = 0usize;
+    let mut next = offset;
+    for u in &updates {
+        let uid = u.get("update_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        if uid + 1 > next {
+            next = uid + 1;
+        }
+        let Some(msg) = u.get("message").or_else(|| u.get("channel_post")) else { continue };
+        let Some((file_id, ext)) = pick_media(msg) else { continue };
+        if download_and_import(&cl, &token, &file_id, &ext).is_ok() {
+            added += 1;
+        }
+    }
+    if next != offset {
+        let mut c = load_config();
+        c.tg_offset = Some(next);
+        let _ = save_config(&c);
+    }
+    added
+}
+
 /// Состояние для настроек (токен наружу не отдаём).
 #[tauri::command]
 pub fn tg_status() -> Value {

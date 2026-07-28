@@ -66,6 +66,10 @@ pub struct Config {
     pub use_trash: Option<bool>, // удалять через корзину (иначе — сразу навсегда)
     #[serde(default)]
     pub trash_days: Option<i64>, // через сколько дней чистить корзину (0 = никогда)
+    #[serde(default)]
+    pub keep_awake: Option<bool>, // не давать ПК засыпать, пока приложение открыто
+    #[serde(default)]
+    pub autostart: Option<String>, // off | ui | background | sync
 }
 
 /// Папка под наблюдением: новые файлы автоматически импортируются.
@@ -230,6 +234,8 @@ pub struct SetupState {
     pub video_gif_width: i64,
     pub use_trash: bool,
     pub trash_days: i64,
+    pub keep_awake: bool,
+    pub autostart: String,
 }
 
 const PIN_RESET_DELAY: i64 = 24 * 3600; // отложенный сброс ПИН — сутки
@@ -298,6 +304,8 @@ pub fn get_setup_state() -> SetupState {
         video_gif_width: c.video_gif_width.unwrap_or(480),
         use_trash: c.use_trash.unwrap_or(true), // по умолчанию — безопасно, через корзину
         trash_days: c.trash_days.unwrap_or(30),
+        keep_awake: c.keep_awake.unwrap_or(false),
+        autostart: c.autostart.unwrap_or_else(|| "off".into()),
     }
 }
 
@@ -1556,6 +1564,40 @@ pub fn count_files(
     .map_err(|e| e.to_string())
 }
 
+/// Все id, попадающие под текущий фильтр/поиск — для действий над всей выдачей,
+/// а не только над загруженными карточками. Группы отдаются одной обложкой,
+/// как в галерее (удаление/группировка сами разворачивают стопку при нужде).
+#[tauri::command]
+pub fn query_file_ids(
+    state: State<AppState>,
+    search: String,
+    collection: Option<i64>,
+    nsfw: Option<i64>,
+    recent: Option<bool>,
+    favorite: Option<bool>,
+) -> Result<Vec<i64>, String> {
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    let (mut where_sql, binds) = build_files_where(conn, &search, collection, nsfw)?;
+    if recent.unwrap_or(false) {
+        where_sql.push_str(" AND f.viewed_at IS NOT NULL");
+    }
+    if favorite.unwrap_or(false) {
+        where_sql.push_str(" AND COALESCE(f.favorite, 0) = 1");
+    }
+    let sql = format!(
+        "SELECT f.id FROM files f WHERE 1=1{where_sql}{GROUP_COVER_WHERE} \
+         ORDER BY f.imported_at DESC, f.id DESC LIMIT 100000"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let out: Vec<i64> = stmt
+        .query_map(params_from_iter(binds.iter()), |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    Ok(out)
+}
+
 /// Статистика и «здоровье» библиотеки: топы, рост по месяцам и проблемные места.
 #[tauri::command]
 pub fn library_health(state: State<AppState>) -> Result<serde_json::Value, String> {
@@ -2325,6 +2367,234 @@ pub fn set_favorite(state: State<AppState>, file_ids: Vec<i64>, on: bool) -> Res
     Ok(())
 }
 
+// ---------- Экспорт / импорт групп (перенос между менеджерами) ----------
+
+/// Выгрузить группу (комикс или вариации) в zip: страницы по порядку +
+/// описание с именем, типом, тегами и источниками каждой страницы.
+#[tauri::command]
+pub async fn group_export(
+    state: State<'_, AppState>,
+    group_id: i64,
+    dest: String,
+) -> Result<i64, String> {
+    let root = get_root(&state)?;
+    // Данные собираем под замком, архив пишем уже без него
+    let (name, kind, pages) = {
+        let guard = state.conn.lock().unwrap();
+        let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+        let (name, kind): (String, String) = conn
+            .query_row("SELECT name, kind FROM groups WHERE id = ?1", [group_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(|_| "Группа не найдена".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, rel_path, ext FROM files WHERE group_id = ?1 \
+                 ORDER BY COALESCE(group_pos, 0), id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([group_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect();
+        let pages: Vec<(PathBuf, String, serde_json::Value)> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (fid, rel, ext))| {
+                let inzip = format!("{:04}.{}", i + 1, ext);
+                (root.join(rel), inzip, collect_meta(conn, *fid))
+            })
+            .collect();
+        (name, kind, pages)
+    };
+    if pages.is_empty() {
+        return Err("В группе нет страниц".into());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<i64, String> {
+        use std::io::Write;
+        use zip::write::FileOptions;
+        let f = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
+        let mut z = zip::ZipWriter::new(f);
+        let opts: FileOptions =
+            FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        let mut manifest_pages = Vec::new();
+        let mut n = 0i64;
+        for (abs, inzip, meta) in &pages {
+            if !abs.exists() {
+                continue; // страницу унесли мимо приложения — пропускаем
+            }
+            z.start_file(inzip, opts).map_err(|e| e.to_string())?;
+            let mut src = std::fs::File::open(abs).map_err(|e| e.to_string())?;
+            std::io::copy(&mut src, &mut z).map_err(|e| e.to_string())?;
+            manifest_pages.push(serde_json::json!({ "file": inzip, "meta": meta }));
+            n += 1;
+        }
+        let manifest = serde_json::json!({
+            "format": "furrymanager-group",
+            "version": 1,
+            "name": name,
+            "kind": kind,
+            "pages": manifest_pages,
+        });
+        z.start_file("group.json", opts).map_err(|e| e.to_string())?;
+        z.write_all(&serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        z.finish().map_err(|e| e.to_string())?;
+        Ok(n)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Загрузить группу из zip: страницы импортируются (точные копии
+/// переиспользуются), теги и источники возвращаются, группа собирается заново.
+#[tauri::command]
+pub async fn group_import(state: State<'_, AppState>, src: String) -> Result<serde_json::Value, String> {
+    let root = get_root(&state)?;
+    let lossless = load_config().lossless.unwrap_or(false);
+
+    // Распаковываем во временную папку (архив читаем вне замка БД)
+    let (name, kind, pages) = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(String, String, Vec<(PathBuf, serde_json::Value)>), String> {
+            use std::io::Read;
+            let f = std::fs::File::open(&src).map_err(|e| format!("Не открылся файл: {e}"))?;
+            let mut z = zip::ZipArchive::new(f).map_err(|e| format!("Не открылся архив: {e}"))?;
+            let mut manifest = String::new();
+            z.by_name("group.json")
+                .map_err(|_| "Это не архив группы (нет group.json)".to_string())?
+                .read_to_string(&mut manifest)
+                .map_err(|e| e.to_string())?;
+            let m: serde_json::Value =
+                serde_json::from_str(&manifest).map_err(|e| e.to_string())?;
+            let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let kind = m.get("kind").and_then(|v| v.as_str()).unwrap_or("comic").to_string();
+
+            let ts = unix_now();
+            let tmp = std::env::temp_dir().join(format!("fm_group_{ts}"));
+            std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+
+            let mut pages = Vec::new();
+            if let Some(list) = m.get("pages").and_then(|v| v.as_array()) {
+                for p in list {
+                    let Some(file) = p.get("file").and_then(|v| v.as_str()) else { continue };
+                    if file.contains("..") || file.contains('/') || file.contains('\\') {
+                        continue; // защита от подмены пути
+                    }
+                    let mut entry = match z.by_name(file) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    let dest = tmp.join(file);
+                    let mut out = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+                    pages.push((dest, p.get("meta").cloned().unwrap_or(serde_json::Value::Null)));
+                }
+            }
+            Ok((name, kind, pages))
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())??;
+
+    if pages.is_empty() {
+        return Err("В архиве нет страниц".into());
+    }
+
+    let guard = state.conn.lock().unwrap();
+    let conn = guard.as_ref().ok_or("Библиотека не настроена")?;
+    let mut ids: Vec<i64> = Vec::new();
+    let (mut added, mut dupes) = (0i64, 0i64);
+    for (path, meta) in &pages {
+        let Ok((fid, is_new)) = import::import_one(conn, &root, path, false, lossless, false) else {
+            continue;
+        };
+        if is_new { added += 1 } else { dupes += 1 }
+        if !ids.contains(&fid) {
+            ids.push(fid);
+        }
+        // Возвращаем теги, источники и рейтинг (коллекции намеренно не тащим)
+        if let Some(tags) = meta.get("tags").and_then(|v| v.as_array()) {
+            for t in tags {
+                let ns = t.get("ns").and_then(|v| v.as_str()).unwrap_or("");
+                let nm = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let origin = t.get("origin").and_then(|v| v.as_str()).unwrap_or("manual");
+                if nm.is_empty() {
+                    continue;
+                }
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO tags (namespace, name) VALUES (?1, ?2)",
+                    params![ns, nm],
+                );
+                if let Ok(tag_id) = conn.query_row(
+                    "SELECT id FROM tags WHERE namespace = ?1 AND name = ?2",
+                    params![ns, nm],
+                    |r| r.get::<_, i64>(0),
+                ) {
+                    let _ = conn.execute(
+                        "INSERT OR IGNORE INTO file_tags (file_id, tag_id, origin) VALUES (?1, ?2, ?3)",
+                        params![fid, tag_id, origin],
+                    );
+                }
+            }
+        }
+        if let Some(srcs) = meta.get("sources").and_then(|v| v.as_array()) {
+            for s in srcs {
+                let _ = conn.execute(
+                    "INSERT INTO sources (file_id, url, site, artist, title) \
+                     SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS \
+                     (SELECT 1 FROM sources WHERE file_id = ?1 AND url = ?2)",
+                    params![
+                        fid,
+                        s.get("url").and_then(|v| v.as_str()),
+                        s.get("site").and_then(|v| v.as_str()),
+                        s.get("artist").and_then(|v| v.as_str()),
+                        s.get("title").and_then(|v| v.as_str())
+                    ],
+                );
+            }
+        }
+        if let Some(n) = meta.get("nsfw").and_then(|v| v.as_i64()) {
+            let _ = conn.execute("UPDATE files SET nsfw = ?1 WHERE id = ?2", params![n, fid]);
+        }
+    }
+    // Чистим временную папку
+    if let Some(dir) = pages.first().and_then(|(p, _)| p.parent()) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    if ids.len() < 2 {
+        return Err("Не удалось собрать группу: страниц меньше двух".into());
+    }
+    // Страницы могли лежать в другой группе — переносим в новую
+    for fid in &ids {
+        let _ = conn.execute(
+            "UPDATE files SET group_id = NULL, group_pos = NULL WHERE id = ?1",
+            params![fid],
+        );
+    }
+    let kind = if kind == "comic" { "comic" } else { "variants" };
+    conn.execute(
+        "INSERT INTO groups (name, kind, created_at) VALUES (?1, ?2, ?3)",
+        params![name, kind, unix_now()],
+    )
+    .map_err(|e| e.to_string())?;
+    let gid = conn.last_insert_rowid();
+    for (i, fid) in ids.iter().enumerate() {
+        let _ = conn.execute(
+            "UPDATE files SET group_id = ?1, group_pos = ?2 WHERE id = ?3",
+            params![gid, i as i64, fid],
+        );
+    }
+    let _ = conn.execute(
+        "DELETE FROM groups WHERE id NOT IN \
+         (SELECT DISTINCT group_id FROM files WHERE group_id IS NOT NULL)",
+        [],
+    );
+    Ok(serde_json::json!({ "group_id": gid, "pages": ids.len(), "added": added, "dupes": dupes }))
+}
+
 // ---------- Корзина ----------
 
 /// Что лежит в корзине (свежие сверху).
@@ -2529,6 +2799,166 @@ pub fn trash_purge(state: State<AppState>, ids: Vec<i64>) -> Result<i64, String>
     Ok(n)
 }
 
+// ---------- Не давать компьютеру засыпать ----------
+// Пока приложение открыто и режим включён, ПК не уходит в сон — иначе
+// мобильная галерея и приём артов с телефона отваливаются вместе с ним.
+// Windows: SetThreadExecutionState действует на ПОТОК, поэтому держим
+// отдельный живой поток. Linux: держим процесс systemd-inhibit.
+static KEEP_AWAKE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KEEP_AWAKE_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+fn keep_awake_worker() {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Power::{
+        SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
+    };
+    loop {
+        unsafe {
+            if KEEP_AWAKE.load(Ordering::SeqCst) {
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+            } else {
+                SetThreadExecutionState(ES_CONTINUOUS);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+}
+
+#[cfg(not(windows))]
+fn keep_awake_worker() {
+    use std::sync::atomic::Ordering;
+    let mut child: Option<std::process::Child> = None;
+    loop {
+        let want = KEEP_AWAKE.load(Ordering::SeqCst);
+        if want && child.is_none() {
+            let mut c = std::process::Command::new("systemd-inhibit");
+            child = c
+                .args([
+                    "--what=sleep:idle",
+                    "--who=FurryManager",
+                    "--why=Доступ с телефона к библиотеке",
+                    "--mode=block",
+                    "sleep",
+                    "infinity",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
+        } else if !want {
+            if let Some(mut c) = child.take() {
+                let _ = c.kill();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+}
+
+/// Включить/выключить удержание системы (и запомнить в настройках).
+pub fn apply_keep_awake(on: bool) {
+    use std::sync::atomic::Ordering;
+    KEEP_AWAKE.store(on, Ordering::SeqCst);
+    if !KEEP_AWAKE_STARTED.swap(true, Ordering::SeqCst) {
+        std::thread::spawn(keep_awake_worker);
+    }
+}
+
+#[tauri::command]
+pub fn set_keep_awake(on: bool) -> Result<(), String> {
+    let mut c = load_config();
+    c.keep_awake = Some(on);
+    save_config(&c)?;
+    apply_keep_awake(on);
+    Ok(())
+}
+
+// ---------- Автозапуск с системой ----------
+// Режимы: off — не запускать; ui — открывать окно; background — работать в фоне
+// (иконка в трее, окно не показывается); sync — тихо подхватить новое из
+// отслеживаемых папок и Telegram и закрыться.
+// Регистрируем сами (без плагина): так режим передаётся аргументом и его можно
+// менять на лету, не пересобирая приложение.
+
+fn autostart_arg(mode: &str) -> &'static str {
+    match mode {
+        "background" => "--background",
+        "sync" => "--sync",
+        _ => "",
+    }
+}
+
+#[cfg(windows)]
+fn autostart_apply(mode: &str) -> Result<(), String> {
+    let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let name = "FurryManager";
+    if mode == "off" {
+        let mut c = std::process::Command::new("reg");
+        no_console(&mut c);
+        let _ = c.args(["delete", key, "/v", name, "/f"]).output();
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let arg = autostart_arg(mode);
+    let value = if arg.is_empty() {
+        format!("\"{}\"", exe.display())
+    } else {
+        format!("\"{}\" {}", exe.display(), arg)
+    };
+    let mut c = std::process::Command::new("reg");
+    no_console(&mut c);
+    let out = c
+        .args(["add", key, "/v", name, "/t", "REG_SZ", "/d", &value, "/f"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "Не удалось прописать автозапуск: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn autostart_apply(mode: &str) -> Result<(), String> {
+    let dir = dirs::config_dir()
+        .ok_or("не найдена папка настроек")?
+        .join("autostart");
+    let file = dir.join("furrymanager.desktop");
+    if mode == "off" {
+        let _ = std::fs::remove_file(&file);
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let arg = autostart_arg(mode);
+    let cmd = if arg.is_empty() {
+        exe.display().to_string()
+    } else {
+        format!("{} {}", exe.display(), arg)
+    };
+    let desktop = format!(
+        "[Desktop Entry]\nType=Application\nName=FurryManager\nExec={cmd}\n\
+         X-GNOME-Autostart-enabled=true\nNoDisplay=false\nTerminal=false\n"
+    );
+    std::fs::write(&file, desktop).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_autostart(mode: String) -> Result<(), String> {
+    let mode = match mode.as_str() {
+        "ui" | "background" | "sync" => mode,
+        _ => "off".to_string(),
+    };
+    autostart_apply(&mode)?;
+    let mut c = load_config();
+    c.autostart = Some(mode);
+    save_config(&c)
+}
+
 /// Настройки корзины (применяются сразу).
 #[tauri::command]
 pub fn set_trash_settings(use_trash: bool, days: i64) -> Result<(), String> {
@@ -2591,6 +3021,11 @@ pub struct CollectionOut {
     pub count: i64,
     pub nsfw: Option<i64>, // явная пометка: 0=SFW, 1=NSFW, None=авто
     pub is_nsfw: bool,     // эффективно NSFW (для режима скрытия)
+}
+
+/// Тот же unix_now для других модулей (сервер собирает группы комиксов).
+pub fn unix_now_pub() -> i64 {
+    unix_now()
 }
 
 fn unix_now() -> i64 {
@@ -3013,7 +3448,10 @@ pub struct AutoGroupProposal {
 /// комиксы — по общему названию из источника (e621/FA title), вариации — по
 /// близкому perceptual hash. Уже сгруппированные файлы не трогаются.
 #[tauri::command]
-pub fn auto_groups_preview(state: State<AppState>) -> Result<Vec<AutoGroupProposal>, String> {
+pub fn auto_groups_preview(
+    state: State<AppState>,
+    threshold: Option<u32>,
+) -> Result<Vec<AutoGroupProposal>, String> {
     use std::collections::{HashMap, HashSet};
     let root = get_root(&state)?;
     let guard = state.conn.lock().unwrap();
@@ -3062,8 +3500,9 @@ pub fn auto_groups_preview(state: State<AppState>) -> Result<Vec<AutoGroupPropos
         });
     }
 
-    // 2) Вариации: near-dupe по phash среди оставшихся (порог мягче «Дубликатов»)
-    const VAR_THRESHOLD: u32 = 12;
+    // 2) Вариации: near-dupe по phash среди оставшихся. Порог задаёт строгость:
+    // строгая (6) — почти одинаковые, обычная (12), свободная (18) — шире охват.
+    let var_threshold: u32 = threshold.unwrap_or(12).clamp(2, 24);
     let rows: Vec<(i64, i64)> = {
         let mut s = conn
             .prepare(
@@ -3084,7 +3523,7 @@ pub fn auto_groups_preview(state: State<AppState>) -> Result<Vec<AutoGroupPropos
     for i in 0..n {
         for j in (i + 1)..n {
             let d = ((rows[i].1 as u64) ^ (rows[j].1 as u64)).count_ones();
-            if d <= VAR_THRESHOLD {
+            if d <= var_threshold {
                 let (a, b) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
                 if a != b {
                     parent[a] = b;
@@ -3461,6 +3900,9 @@ pub async fn semantic_search(
         extra.push_str(&nsfw_clause(n));
     }
     extra.push_str(&filters.sql);
+    // Группы показываем одной стопкой — как в обычной галерее. Без этого
+    // умный поиск выдавал каждую страницу комикса отдельной карточкой.
+    extra.push_str(GROUP_COVER_WHERE);
     let free = filters.free.join(" ");
 
     // Только фильтры без свободного текста — хронологическая выдача (score = -1)

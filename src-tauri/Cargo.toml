@@ -1,6 +1,6 @@
 [package]
 name = "furrymanager"
-version = "0.6.0"
+version = "0.8.0"
 edition = "2021"
 description = "Локальный менеджер фурри-артов и референсов"
 
@@ -8,7 +8,7 @@ description = "Локальный менеджер фурри-артов и ре
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset"] }
+tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-opener = "2"
@@ -29,7 +29,7 @@ md-5 = "0.10"
 zip = { version = "0.6", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Power"] }
 
 [profile.release]
 lto = true

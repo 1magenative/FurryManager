@@ -207,7 +207,18 @@ body.masonry #gallery .mcol {
 body.masonry #gallery .card { aspect-ratio: auto; }
 body.masonry #gallery .card img { height: auto; object-fit: contain; }
 body.masonry #gallery .card .noimg { height: 150px; }
-body.masonry #gallery .card.gstack { overflow: visible; }
+/* Стопка групп в «водопаде»: обложка должна быть В ПОТОКЕ, иначе карточка
+   схлопывается в ноль (высоту ей задавать нечем) и слои с бейджами наезжают
+   друг на друга. Сверху — воздух под выглядывающие верхушки страниц. */
+body.masonry #gallery .card.gstack { overflow: visible; margin-top: 14px; }
+body.masonry #gallery .card.gstack .gcover { position: static; inset: auto; }
+body.masonry #gallery .card.gstack .gcover img { height: auto; object-fit: contain; }
+/* Верхушки страниц: в «водопаде» страницы обычно вытянутые, и их верх часто
+   почти пустой — толстые тёмные полосы выглядели как чёрные плашки. Делаем
+   слои тоньше и светлее, чтобы читались как края листов под обложкой. */
+body.masonry #gallery .card.gstack .gs { height: 14px; }
+body.masonry #gallery .card.gstack .gs1 { top: -6px; filter: brightness(.85) saturate(.9); }
+body.masonry #gallery .card.gstack .gs2 { top: -11px; filter: brightness(.6) saturate(.8); }
 
 /* Скрыть подписи на миниатюрах */
 body.nobadges #gallery .badge,
@@ -554,6 +565,28 @@ button.danger:hover { background: var(--danger); color: #fff; }
 .set-tab { display: none; }
 .set-tab.active { display: block; }
 
+/* Справка: текст разбит на карточки — читать проще, чем сплошную простыню */
+#help .modal { text-align: left; }
+.help-card {
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+.help-card h3 {
+  font-size: 14px; margin-bottom: 8px; color: var(--accent-2);
+}
+.help-card p { color: var(--text); margin-bottom: 8px; font-size: 13px; line-height: 1.55; }
+.help-card p:last-child { margin-bottom: 0; }
+.help-card ul, .help-card ol { margin: 0 0 8px 18px; font-size: 13px; line-height: 1.6; }
+.help-card li { margin-bottom: 4px; }
+.help-card .muted { color: var(--muted); }
+.keys-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.keys-table td { padding: 5px 4px; border-bottom: 1px solid var(--line); }
+.keys-table tr:last-child td { border-bottom: none; }
+.keys-table td:first-child { width: 150px; white-space: nowrap; }
+
 /* Настройки: кнопки справки и сохранения */
 .set-help-row { margin-bottom: 4px; }
 .set-help-row button { flex: 1; }
@@ -674,12 +707,15 @@ button.danger:hover { background: var(--danger); color: #fff; }
 }
 .dupe-check input { accent-color: var(--danger); }
 .dupe-footer {
-  position: sticky; bottom: 0;
-  margin-top: 16px; padding-top: 12px;
+  position: sticky; bottom: 0; z-index: 2;
+  margin-top: 16px; padding: 12px 0 6px;
   border-top: 1px solid var(--line);
   background: var(--bg2);
-  display: flex; justify-content: flex-end;
+  display: flex; justify-content: flex-end; align-items: center;
+  gap: 8px; flex-wrap: wrap;
 }
+/* Кнопки не растягиваем и не переносим по словам — иначе панель «разъезжается» */
+.dupe-footer button { flex: 0 0 auto; white-space: nowrap; }
 
 /* Автораспределение по коллекциям */
 #autocol .modal { width: min(720px, 94vw); text-align: left; }
@@ -747,6 +783,35 @@ body.ontop::after {
   box-shadow: var(--shadow);
 }
 #ontop-hint button { padding: 3px 10px; font-size: 12px; border: 1px solid var(--line2); }
+
+/* Обзор страниц комикса — сетка миниатюр поверх просмотрщика */
+#viewer-pages { position: absolute; top: 14px; left: 100px; z-index: 51; font-size: 17px; }
+#pages-panel {
+  position: absolute; top: 60px; left: 14px; z-index: 52;
+  width: min(560px, 46vw); max-height: calc(100vh - 90px);
+  display: flex; flex-direction: column;
+  background: var(--bg2); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+}
+#pages-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 10px 8px 14px; border-bottom: 1px solid var(--line); font-size: 13px;
+}
+#pages-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 8px; padding: 10px; overflow-y: auto;
+}
+.pg-item { position: relative; cursor: pointer; border: 2px solid transparent; border-radius: 8px; }
+.pg-item img { width: 100%; height: 100px; object-fit: cover; border-radius: 6px; display: block; }
+.pg-item .ph { height: 100px; display: flex; align-items: center; justify-content: center;
+               background: var(--bg3); border-radius: 6px; font-size: 22px; }
+.pg-item .n {
+  position: absolute; left: 4px; bottom: 4px; font-size: 11px;
+  background: rgba(0,0,0,.7); color: #fff; padding: 0 5px; border-radius: 5px;
+}
+.pg-item:hover { border-color: var(--accent); }
+.pg-item.cur { border-color: var(--accent); }
+.pg-item.cur .n { background: var(--accent); color: #1b1206; font-weight: 600; }
 
 /* ★ в просмотрщике — рядом с крестиком закрытия */
 #viewer-fav {

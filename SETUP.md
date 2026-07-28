@@ -173,7 +173,7 @@ bash release.sh           # приложение + пакеты
 ```
 
 Готовое — в `src-tauri/target/release/bundle/` (deb, appimage).
-Установка: `sudo apt install ./FurryManager_0.6.0_amd64.deb`
+Установка: `sudo apt install ./FurryManager_0.8.0_amd64.deb`
 
 ## Отличия Linux-версии
 

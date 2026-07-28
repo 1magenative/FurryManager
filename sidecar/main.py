@@ -63,6 +63,17 @@ def send(obj):
     REAL_STDOUT.flush()
 
 
+# id текущего запроса — чтобы промежуточные сообщения о ходе работы
+# (например, сколько страниц комикса уже скачано) можно было привязать к нему.
+CURRENT_ID = None
+
+
+def progress(data):
+    """Промежуточный отчёт о ходе выполнения; ответ на запрос будет отдельно."""
+    if CURRENT_ID is not None:
+        send({"id": CURRENT_ID, "progress": data})
+
+
 def log(*a):
     print("[sidecar]", *a, file=sys.stderr, flush=True)
 
@@ -220,25 +231,147 @@ def _extract_meta(meta):
     return artist, str(title)[:200], tags, url
 
 
+def _gallery_dl_call(args):
+    """Вызов gallery-dl В ЭТОМ ЖЕ процессе.
+
+    Раньше вызывали `sys.executable -m gallery_dl`. В собранном PyInstaller
+    бинарнике sys.executable — это сам сайдкар, а не python: запускался второй
+    экземпляр сайдкара, который молча ждал команды на stdin, и скачивание
+    «висело» до таймаута. Поэтому дёргаем точку входа напрямую.
+
+    sys.stdout подменяем на stderr: gallery-dl печатает прогресс в stdout, а
+    ответы протокола идут через REAL_STDOUT (сохранён при старте), так что
+    подмена безопасна.
+    """
+    import contextlib
+    import logging
+    import gallery_dl
+
+    # Вызов в том же процессе оставляет состояние от прошлого раза: gallery-dl
+    # каждый раз вешает новый обработчик логов (строки начинали дублироваться)
+    # и держит прежний конфиг. Чистим перед запуском.
+    try:
+        from gallery_dl import config as gdl_config
+        gdl_config.clear()
+    except Exception:
+        pass
+    root_logger = logging.getLogger()
+    for h in root_logger.handlers[:]:
+        root_logger.removeHandler(h)
+
+    old_argv, old_stdin, old_stdout = sys.argv, sys.stdin, sys.stdout
+    sys.argv = ["gallery-dl"] + list(args)
+
+    # gallery-dl при запуске перенастраивает кодировку стандартных потоков
+    # (stdout/stderr/stdin). Наш stdin уже читается основным циклом, а
+    # перенастройка прочитанного потока запрещена — отсюда была ошибка
+    # «not possible to set the encoding … after the first read».
+    # Поэтому на время вызова подсовываем свежие потоки:
+    #   stdin  — пустой (gallery-dl ввод не нужен),
+    #   stdout — отдельная обёртка над stderr (в наш протокол он не попадёт).
+    # Основной цикл держит ссылку на настоящий stdin, подмена ему не мешает.
+    devnull = open(os.devnull, "r", encoding="utf-8")
+    try:
+        fresh_out = os.fdopen(os.dup(2), "w", encoding="utf-8", errors="replace")
+    except Exception:
+        fresh_out = sys.stderr
+
+    code = 0
+    try:
+        sys.stdin = devnull
+        with contextlib.redirect_stdout(fresh_out):
+            try:
+                gallery_dl.main()
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else 0
+    finally:
+        sys.stdin = old_stdin
+        sys.stdout = old_stdout
+        for f in (devnull, fresh_out):
+            if f is not sys.stderr:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+        sys.argv = old_argv
+    return code
+
+
+def _run_gallery_dl(args, timeout=1800):
+    """То же, но со сторожем по времени: зависшее скачивание не должно
+    блокировать сайдкар навсегда (иначе встают и ИИ, и вся очередь)."""
+    import threading
+
+    box = {"code": 0, "err": None}
+
+    def work():
+        try:
+            box["code"] = _gallery_dl_call(args)
+        except BaseException as e:  # noqa: BLE001 — любую ошибку отдаём наверх
+            box["err"] = repr(e)
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise RuntimeError(
+            "gallery-dl не ответил за {} мин — прервано. Проверь ссылку и связь.".format(
+                timeout // 60
+            )
+        )
+    if box["err"]:
+        raise RuntimeError("gallery-dl: " + box["err"])
+    return box["code"]
+
+
 def m_download(params):
-    import subprocess
     import tempfile
 
     url = params["url"]
+    comic = bool(params.get("comic"))
     tmp = tempfile.mkdtemp(prefix="fm_dl_")
-    cmd = [sys.executable, "-m", "gallery_dl", "--write-metadata", "-D", tmp]
+    args = ["--write-metadata", "-D", tmp]
     # Куки залогиненного браузера — для возрастного контента FA/e621
     browser = (params.get("cookies") or "").strip()
     if browser:
-        cmd += ["--cookies-from-browser", browser]
-    cmd.append(url)
-    log("gallery-dl:", url)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        args += ["--cookies-from-browser", browser]
+    # Порядок страниц НЕ задаём через --filename: у части сайтов (в т.ч. e621)
+    # нет полей {num}/{filename}, и вся закачка пула молча ломается. Берём
+    # позицию из метаданных ниже и сортируем сами.
+    args.append(url)
+    log("gallery-dl:", url, "(комикс)" if comic else "")
+
+    # Пока идёт скачивание, раз в 2 секунды сообщаем, сколько файлов уже легло:
+    # у больших комиксов сбор занимает минуты, и без этого непонятно, живо ли.
+    import threading as _th
+
+    stop = _th.Event()
+
+    def _watch():
+        last = -1
+        while not stop.is_set():
+            try:
+                n = len([f for f in os.listdir(tmp) if not f.endswith(".json")])
+                if n != last:
+                    last = n
+                    progress({"files": n, "comic": comic})
+            except Exception:
+                pass
+            stop.wait(2)
+
+    watcher = _th.Thread(target=_watch, daemon=True)
+    watcher.start()
+    try:
+        code = _run_gallery_dl(args)
+    finally:
+        stop.set()
 
     media = [f for f in sorted(os.listdir(tmp)) if not f.endswith(".json")]
     if not media:
-        tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
-        raise RuntimeError("gallery-dl не скачал файлы: " + " | ".join(tail))
+        raise RuntimeError(
+            "gallery-dl не скачал файлы (код {}). Проверь ссылку; для взрослого "
+            "контента укажи браузер с куками в настройках.".format(code)
+        )
 
     items = []
     for f in media:
@@ -252,14 +385,35 @@ def m_download(params):
             except Exception as e:
                 log("meta parse fail:", mj, repr(e))
         artist, title, tags, post_url = _extract_meta(meta)
+        pool = meta.get("pool")
+        if isinstance(pool, dict):
+            pool_name = pool.get("name") or ""
+        elif isinstance(pool, list) and pool:
+            first = pool[0]
+            pool_name = first.get("name", "") if isinstance(first, dict) else ""
+        else:
+            pool_name = ""
+        # Позиция страницы в комиксе: сначала явные поля gallery-dl, затем
+        # место поста в списке пула, иначе — порядок имени файла.
+        pos = meta.get("num")
+        if pos is None and isinstance(pool, dict):
+            ids = pool.get("post_ids")
+            pid = meta.get("id")
+            if isinstance(ids, list) and pid in ids:
+                pos = ids.index(pid)
         items.append({
             "path": path,
+            "pos": pos if isinstance(pos, int) else None,
+            "pool": str(pool_name).replace("_", " ").strip(),
             "url": post_url or url,
             "site": meta.get("category", ""),
             "artist": artist,
             "title": title,
             "tags": tags,
         })
+    # Для комикса выстраиваем страницы по позиции (у кого её нет — в конец)
+    if comic:
+        items.sort(key=lambda it: (it["pos"] is None, it["pos"] if it["pos"] is not None else 0))
     log("скачано файлов:", len(items))
     return {"dir": tmp, "items": items}
 
@@ -288,7 +442,12 @@ def main():
             if fn is None:
                 send({"id": rid, "error": "нет метода " + str(req.get("method"))})
                 continue
-            send({"id": rid, "result": fn(req.get("params") or {})})
+            global CURRENT_ID
+            CURRENT_ID = rid
+            try:
+                send({"id": rid, "result": fn(req.get("params") or {})})
+            finally:
+                CURRENT_ID = None
         except Exception as e:
             traceback.print_exc()
             send({"id": rid, "error": str(e)})

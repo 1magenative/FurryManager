@@ -42,6 +42,8 @@ const state = {
   display: null,         // тема, размер миниатюр, водопад, бейджи, компакт
   useTrash: true,        // удалять через корзину
   trashDays: 30,         // через сколько дней чистить корзину (0 = никогда)
+  keepAwake: false,      // не давать ПК засыпать, пока приложение открыто
+  autostart: "off",      // автозапуск: off | ui | background | sync
   gifAuto: false,        // авто-конвертация коротких видео в GIF
   gifSecs: 5,            // порог длительности для видео→GIF
   gifReplace: false,     // заменять оригинал видео на GIF
@@ -189,6 +191,9 @@ function openSettings() {
   $("set-compact").checked = !!d.compact;
   $("set-hide-colscroll").checked = !!d.nocolscroll;
   // Корзина
+  $("set-autostart").value = state.autostart || "off";
+  updateAutostartHint();
+  $("set-keep-awake").checked = !!state.keepAwake;
   $("set-use-trash").checked = state.useTrash !== false;
   $("set-trash-days").value = state.trashDays ?? 30;
   $("trash-days-wrap").classList.toggle("hidden", state.useTrash === false);
@@ -260,6 +265,36 @@ async function saveTrashSettings() {
   $("trash-days-wrap").classList.toggle("hidden", !useTrash);
   try { await invoke("set_trash_settings", { useTrash, days }); } catch (e) { alert(e); }
 }
+// Автозапуск с системой — применяется сразу (правит автозапуск ОС)
+const AUTOSTART_HINTS = {
+  off: "Приложение не запускается само.",
+  ui: "При входе в систему откроется обычное окно менеджера.",
+  background: "Менеджер запустится без окна — значок в трее. Оттуда его можно открыть (двойной клик или меню). Крестик в этом режиме прячет окно в трей, а не закрывает приложение — выход через меню трея.",
+  sync: "При входе в систему менеджер тихо проверит отслеживаемые папки и Telegram-бота, добавит новое и закроется. Окно не появится. Если менеджер уже открыт — ничего не сделает.",
+};
+function updateAutostartHint() {
+  $("autostart-hint").textContent = AUTOSTART_HINTS[$("set-autostart").value] || "";
+}
+$("set-autostart").addEventListener("change", async (e) => {
+  const mode = e.target.value;
+  updateAutostartHint();
+  try {
+    await invoke("set_autostart", { mode });
+    state.autostart = mode;
+  } catch (err) {
+    alert("Автозапуск: " + err);
+    $("set-autostart").value = state.autostart || "off";
+    updateAutostartHint();
+  }
+});
+
+// Удержание системы от сна — применяется сразу
+$("set-keep-awake").addEventListener("change", async (e) => {
+  const on = e.target.checked;
+  state.keepAwake = on;
+  try { await invoke("set_keep_awake", { on }); } catch (err) { alert(err); }
+});
+
 $("set-use-trash").addEventListener("change", saveTrashSettings);
 $("set-trash-days").addEventListener("change", saveTrashSettings);
 
@@ -753,13 +788,16 @@ $("ext-token-copy").addEventListener("click", async () => {
     setTimeout(() => ($("ext-token-copy").textContent = "📋"), 1500);
   } catch {}
 });
-// Вкладки настроек
-document.querySelectorAll(".set-tab-btn").forEach((btn) =>
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".set-tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
-    document.querySelectorAll(".set-tab").forEach((t) =>
-      t.classList.toggle("active", t.dataset.tab === btn.dataset.tab));
-  }));
+// Вкладки настроек и справки. Область ограничиваем контейнером: иначе клик по
+// вкладке справки сбрасывал бы активную вкладку настроек (и наоборот).
+document.querySelectorAll("#settings, #help").forEach((box) => {
+  box.querySelectorAll(".set-tab-btn").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      box.querySelectorAll(".set-tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
+      box.querySelectorAll(".set-tab").forEach((t) =>
+        t.classList.toggle("active", t.dataset.tab === btn.dataset.tab));
+    }));
+});
 
 $("btn-settings").addEventListener("click", openSettings);
 $("settings-close").addEventListener("click", () => $("settings").classList.add("hidden"));
@@ -958,6 +996,49 @@ $("sort-select").addEventListener("change", (e) => {
 $("sort-shuffle").addEventListener("click", () => {
   newRandSeed();
   loadMore(true);
+});
+
+// ---------- Обзор страниц группы (комиксы бывают на десятки страниц) ----------
+function pagesAvailable() {
+  return !!(state.g && state.g.files && state.g.files.length > 1);
+}
+function updatePagesBtn() {
+  $("viewer-pages").classList.toggle("hidden", !pagesAvailable());
+  if (!pagesAvailable()) $("pages-panel").classList.add("hidden");
+  else if (!$("pages-panel").classList.contains("hidden")) renderPagesPanel();
+}
+function renderPagesPanel() {
+  if (!pagesAvailable()) return;
+  const g = state.g;
+  $("pages-title").textContent =
+    (g.name ? g.name + " — " : "") + `${g.files.length} стр.`;
+  $("pages-grid").innerHTML = g.files.map((f, i) => {
+    const src = f.thumb || (f.kind === "video" ? "" : f.path);
+    const inner = src
+      ? `<img loading="lazy" src="${mediaSrc(src)}" alt=""/>`
+      : `<div class="ph">🎬</div>`;
+    return `<div class="pg-item ${i === g.idx ? "cur" : ""}" data-i="${i}" data-id="${f.id}">` +
+      `${inner}<span class="n">${i + 1}</span></div>`;
+  }).join("");
+  // У свежескачанных видео превью ещё нет — снимаем кадр и подставляем
+  queueVideoThumbs(g.files);
+  // Текущую страницу — в поле зрения
+  const cur = $("pages-grid").querySelector(".pg-item.cur");
+  if (cur) cur.scrollIntoView({ block: "nearest" });
+}
+function togglePagesPanel() {
+  if (!pagesAvailable()) return;
+  const p = $("pages-panel");
+  const willShow = p.classList.contains("hidden");
+  p.classList.toggle("hidden", !willShow);
+  if (willShow) renderPagesPanel();
+}
+$("viewer-pages").addEventListener("click", togglePagesPanel);
+$("pages-close").addEventListener("click", () => $("pages-panel").classList.add("hidden"));
+$("pages-grid").addEventListener("click", (e) => {
+  const el = e.target.closest(".pg-item[data-i]");
+  if (!el) return;
+  showGroupPage(Number(el.dataset.i)); // панель остаётся открытой — удобно листать
 });
 
 // Индикатор ★ в просмотрщике (и подсветка кнопки)
@@ -1191,6 +1272,9 @@ async function processThumbQueue() {
     card.thumb = abs;
     const el = document.querySelector(`.card[data-id="${card.id}"] .noimg`);
     if (el) el.outerHTML = `<img loading="lazy" src="${mediaSrc(abs)}" alt="" />`;
+    // И в панели страниц комикса, если она открыта
+    const pg = document.querySelector(`.pg-item[data-id="${card.id}"] .ph`);
+    if (pg) pg.outerHTML = `<img loading="lazy" src="${mediaSrc(abs)}" alt="" />`;
   } catch (e) {
     console.warn("video thumb:", card.id, e);
   }
@@ -1549,6 +1633,13 @@ $("gallery").addEventListener("click", (e) => {
     state.lastIndex = i;
   } else if (e.shiftKey && state.lastIndex !== null) {
     const [a, b] = [Math.min(state.lastIndex, i), Math.max(state.lastIndex, i)];
+    // Порядок выделения = порядок в группе. Якорь уже лежит в наборе, поэтому
+    // без пере-добавления получалось «первый, потом хвост задом наперёд».
+    // Снимаем весь диапазон и добавляем заново строго по возрастанию.
+    for (let k = a; k <= b; k++) {
+      const c = state.cards[k];
+      if (c) state.selected.delete(c.id);
+    }
     for (let k = a; k <= b; k++) selectIndex(k, true);
     renderSelectBar();
   } else {
@@ -1591,7 +1682,14 @@ function renderSelectBar() {
   const n = state.selected.size;
   $("select-bar").classList.toggle("hidden", n === 0);
   if (n === 0) hideSelPanel();
-  $("sel-count").textContent = `Выбрано: ${n}`;
+  // Часть выбранного может быть ещё не подгружена в ленту — это нормально,
+  // массовые действия работают по id и не требуют карточки на экране.
+  const offscreen = n - [...state.selected].filter((id) => state.cards.some((c) => c.id === id)).length;
+  $("sel-count").textContent = offscreen > 0
+    ? `Выбрано: ${n} (на экране ${n - offscreen})`
+    : `Выбрано: ${n}`;
+  // «Все по фильтру» — только для обычной ленты (у похожих/умного поиска выдача ограничена)
+  $("sel-all-match").classList.toggle("hidden", !!(state.similarTo || state.smart));
   document.querySelectorAll(".nsfw-only").forEach((el) =>
     el.classList.toggle("hidden", !state.nsfwSplit));
   // «Убрать из коллекции» — только когда открыт фильтр конкретной коллекции
@@ -1618,6 +1716,31 @@ function selectAllVisible() {
   renderSelectBar();
 }
 
+// Выделить ВСЮ выдачу текущего фильтра/поиска, а не только подгруженное.
+// Дальше работают обычные массовые действия (теги, коллекции, рейтинг, удаление).
+async function selectAllMatching() {
+  if (state.similarTo || state.smart) {
+    // «Похожие» и умный поиск отдают ограниченную выборку — берём загруженное
+    selectAllVisible();
+    return;
+  }
+  let ids = [];
+  try {
+    ids = await invoke("query_file_ids", {
+      search: state.query, collection: state.collection, nsfw: state.nsfw,
+      recent: state.recent, favorite: state.favOnly,
+    });
+  } catch (e) { return alert(e); }
+  if (!ids.length) return;
+  state.selected = new Set(ids);
+  // Отмечаем то, что уже на экране
+  document.querySelectorAll(".card[data-id]").forEach((el) => {
+    el.classList.toggle("selected", state.selected.has(Number(el.dataset.id)));
+  });
+  renderSelectBar();
+}
+
+$("sel-all-match").addEventListener("click", selectAllMatching);
 $("sel-del").addEventListener("click", () => deleteFiles([...state.selected], true)); // стопки — целиком
 
 // Убрать выбранные из открытой коллекции
@@ -2197,6 +2320,33 @@ $("mi-paste").addEventListener("click", () => {
   $("import-menu").classList.add("hidden");
   pasteFromClipboard(); // сам покажет «в буфере нет изображения», если пусто
 });
+
+// Скачивание по ссылке из самого менеджера (то же, что делает расширение).
+// Ссылка на пул/комикс качается целиком и собирается в одну группу.
+$("mi-link").addEventListener("click", async () => {
+  $("import-menu").classList.add("hidden");
+  const url = prompt("Ссылка на арт или комикс (e621, FurAffinity, Twitter…):");
+  if (!url || !url.trim()) return;
+  const body = { token: state.httpToken, url: url.trim() };
+  // Похоже на пул — спросим, качать ли целиком (иначе бэкенд решит сам)
+  if (/\/pools\/|pool_id=/i.test(url)) {
+    body.comic = await tauriDialog.ask(
+      "Похоже на комикс (пул). Скачать его целиком?\n\n" +
+      "ОК — все страницы, соберу в одну группу-комикс\n" +
+      "Отмена — только этот арт",
+      { title: "FurryManager" });
+  }
+  try {
+    const r = await fetch(`http://127.0.0.1:${state.httpPort || 7877}/ingest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) alert("Не получилось отправить ссылку (HTTP " + r.status + ")");
+  } catch (e) {
+    alert("Не удалось отправить ссылку: " + e);
+  }
+});
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".menu-wrap")) {
     $("import-menu").classList.add("hidden");
@@ -2302,6 +2452,10 @@ listen("web-import", (ev) => {
   $("import-toast").querySelector(".toast-title").textContent = "Скачиваю из сети…";
   $("import-info").textContent = p.line || "";
   if (p.stage === "start") $("import-bar").style.width = "30%";
+  if (p.stage === "queue") {
+    // Ссылки копятся в очереди — показываем, сколько осталось, и ждём дальше
+    $("import-bar").style.width = "15%";
+  }
   if (p.stage === "error") {
     $("import-toast").querySelector(".toast-title").textContent = "Скачивание не удалось";
     $("import-bar").style.width = "0%";
@@ -2435,6 +2589,7 @@ function renderViewerMedia(card) {
   }
   resetZoom(); // новый арт — сбрасываем зум и пипетку
   updateViewerFav(); // ★ показываем состояние открытого арта
+  updatePagesBtn();  // кнопка «все страницы» — только для групп
 }
 
 async function loadViewerDetails(card) {
@@ -2504,6 +2659,7 @@ async function openViewer(i) {
 function closeViewer() {
   $("viewer").classList.add("hidden");
   $("viewer-media").innerHTML = ""; // останавливает видео
+  $("pages-panel").classList.add("hidden");
   state.viewerIndex = -1;
   state.g = null;
   resetZoom();
@@ -3182,6 +3338,9 @@ document.addEventListener("keydown", (e) => {
   } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.code === "KeyH")) {
     e.preventDefault();
     toggleHideNsfw(); // тотальное скрытие NSFW (Ctrl+Shift+H, любая раскладка)
+  } else if (!e.ctrlKey && !e.metaKey && !e.altKey && e.code === "KeyP" && pagesAvailable()) {
+    e.preventDefault();
+    togglePagesPanel(); // все страницы комикса сеткой
   } else if (!e.ctrlKey && !e.metaKey && !e.altKey && e.code === "KeyF") {
     // F — переключить ★ у открытого арта или у выделенных
     const ids = state.selected.size ? [...state.selected]
@@ -3841,6 +4000,62 @@ $("ge-save").addEventListener("click", async () => {
   reloadKeepScroll();
 });
 
+// Экспорт группы в один файл — для переноса в другой FurryManager
+$("ge-export").addEventListener("click", async () => {
+  const name = ($("ge-name").value || "group").trim().replace(/[\\/:*?"<>|]/g, "_");
+  let dest;
+  try {
+    dest = await tauriDialog.save({
+      title: "Сохранить группу",
+      defaultPath: `${name || "group"}.fmgroup.zip`,
+      filters: [{ name: "Группа FurryManager", extensions: ["zip"] }],
+    });
+  } catch (e) { return alert(e); }
+  if (!dest) return;
+  const btn = $("ge-export");
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "Сохраняю…";
+  try {
+    const n = await invoke("group_export", { groupId: geGroupId, dest });
+    alert(`Готово: выгружено страниц — ${n}.\n\nФайл: ${dest}`);
+  } catch (e) { alert(e); }
+  finally { btn.disabled = false; btn.textContent = old; }
+});
+
+// Импорт группы из файла (Импорт → «Импорт группы из файла…»)
+$("mi-group-import").addEventListener("click", async () => {
+  $("import-menu").classList.add("hidden");
+  let src;
+  try {
+    src = await tauriDialog.open({
+      title: "Выбери файл группы",
+      multiple: false,
+      filters: [{ name: "Группа FurryManager", extensions: ["zip"] }],
+    });
+  } catch (e) { return alert(e); }
+  if (!src) return;
+  const toast = $("import-toast");
+  toast.classList.remove("hidden");
+  toast.querySelector(".toast-title").textContent = "Импорт группы…";
+  $("import-cancel").classList.add("hidden");
+  $("import-bar").style.width = "40%";
+  $("import-info").textContent = "Распаковываю и добавляю страницы…";
+  try {
+    const r = await invoke("group_import", { src });
+    $("import-bar").style.width = "100%";
+    $("import-info").textContent =
+      `Готово: страниц ${r.pages} (новых ${r.added}, уже были ${r.dupes})`;
+    setTimeout(() => toast.classList.add("hidden"), 5000);
+    refreshStats();
+    loadMore(true);
+    backgroundIndex();
+    openGroupEditor(r.group_id); // сразу можно поправить имя и порядок
+  } catch (e) {
+    $("import-info").textContent = "Импорт группы: " + e;
+    setTimeout(() => toast.classList.add("hidden"), 8000);
+  }
+});
+
 $("ge-dissolve").addEventListener("click", async () => {
   const yes = await tauriDialog.ask(
     "Распустить группу? Арты останутся в библиотеке как одиночные.",
@@ -3926,9 +4141,25 @@ function renderDupes() {
   updateDupeDelBtn();
 }
 function updateDupeDelBtn() {
-  $("dupe-del").textContent = `🗑 Удалить отмеченные (${dupeMarked.size})`;
+  $("dupe-del").textContent = `🗑 Удалить (${dupeMarked.size})`;
   $("dupe-del").disabled = dupeMarked.size === 0;
+  $("dupe-group").textContent = `🧩 Сгруппировать (${dupeMarked.size})`;
+  $("dupe-group").disabled = dupeMarked.size < 2; // группа — минимум из двух
 }
+
+// Собрать отмеченные почти-копии в группу «вариации», не уходя из окна
+$("dupe-group").addEventListener("click", async () => {
+  const ids = [...dupeMarked];
+  if (ids.length < 2) return;
+  try {
+    const gid = await invoke("group_create", { fileIds: ids, kind: "variants", name: null });
+    dupeMarked.clear();
+    $("dupes").classList.add("hidden");
+    refreshStats();
+    loadMore(true);
+    openGroupEditor(gid); // сразу можно задать имя и порядок
+  } catch (e) { alert(e); }
+});
 $("dupes-list").addEventListener("change", (e) => {
   const cb = e.target.closest("input[type=checkbox][data-id]");
   if (!cb) return;
@@ -3969,22 +4200,28 @@ let agProposals = [];
 const agChecked = new Set();
 let agExcluded = new Map(); // gi -> Set(fid): выброшенные из предложения арты
 
-$("dupe-autogroup").addEventListener("click", async () => {
-  $("dupes").classList.add("hidden");
+async function scanAutoGroups() {
   $("autogroups").classList.remove("hidden");
   $("ag-status").textContent = "Ищу вариации и комиксы…";
   $("ag-list").innerHTML = "";
   agChecked.clear();
   agExcluded = new Map();
+  const threshold = Number($("ag-strict").value) || 12;
   try {
-    agProposals = await invoke("auto_groups_preview");
+    agProposals = await invoke("auto_groups_preview", { threshold });
   } catch (e) {
     $("ag-status").textContent = "Ошибка: " + e;
     return;
   }
   agProposals.forEach((_, i) => agChecked.add(i));
   renderAgList();
+}
+$("dupe-autogroup").addEventListener("click", () => {
+  $("dupes").classList.add("hidden");
+  scanAutoGroups();
 });
+// Смена строгости — пересобираем предложения
+$("ag-strict").addEventListener("change", scanAutoGroups);
 
 function renderAgList() {
   if (!agProposals.length) {
@@ -4184,6 +4421,8 @@ async function boot() {
   state.gifWidth = setup.video_gif_width || 480;
   state.useTrash = setup.use_trash !== false;
   state.trashDays = setup.trash_days ?? 30;
+  state.keepAwake = !!setup.keep_awake;
+  state.autostart = setup.autostart || "off";
   state.httpToken = setup.http_token;
   state.httpPort = setup.http_port;
   state.ready = true; // фильтры установлены — можно грузить галерею

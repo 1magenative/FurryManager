@@ -123,8 +123,8 @@ powershell -ExecutionPolicy Bypass -File release.ps1 -SkipSidecar
 ## Перед выпуском новой версии
 
 1. Подними версию **в двух местах** (они должны совпадать):
-   - `src-tauri/Cargo.toml` → `version = "0.6.0"`
-   - `src-tauri/tauri.conf.json` → `"version": "0.6.0"`
+   - `src-tauri/Cargo.toml` → `version = "0.9.0"`
+   - `src-tauri/tauri.conf.json` → `"version": "0.9.0"`
 2. Обнови `PROJECT.md` (что нового).
 3. Собери релиз скриптом выше и проверь установку поверх предыдущей версии.
 

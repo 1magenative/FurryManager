@@ -207,10 +207,19 @@ pub fn start(app: AppHandle, port: u16, token: String, lan: bool) {
                     reply(request, 400, r#"{"error":"no url"}"#);
                     continue;
                 };
-                // Отвечаем сразу, качаем в фоне
+                // Отвечаем сразу, качаем в фоне через очередь.
+                // comic=true просит скачать пул/комикс целиком; если явно не
+                // указано — определяем по самой ссылке (e621 pools / pool_id).
+                let want_comic = val.get("comic").and_then(|v| v.as_bool());
+                let (target, comic) = match (want_comic, comic_url(&url)) {
+                    (Some(false), _) => (url, false),
+                    (Some(true), Some(p)) => (p, true),
+                    (Some(true), None) => (url, true),
+                    (None, Some(p)) => (p, true), // ссылка сама указывает на пул
+                    (None, None) => (url, false),
+                };
                 reply(request, 200, r#"{"ok":true}"#);
-                let app2 = app.clone();
-                std::thread::spawn(move || process_url(app2, url));
+                enqueue_download(app.clone(), target, comic);
             } else {
                 // /ingest-file: {token, data_b64, ext} — файл с телефона (или другого клиента)
                 let Some(data) = val.get("data_b64").and_then(|d| d.as_str()).map(String::from)
@@ -445,8 +454,26 @@ fn handle_get_api(request: tiny_http::Request, path: &str, qs: &HashMap<String, 
             binds.push(pat.clone());
             binds.push(pat);
         }
+        // Порядок — как в менеджере. «Случайно» с зерном: без него страницы
+        // перемешивались бы при каждой подгрузке (дубли и пропуски).
+        let order: String = match qs.get("sort").map(|s| s.as_str()).unwrap_or("") {
+            "old" => "f.imported_at ASC, f.id ASC".into(),
+            "big" => "f.size DESC, f.id DESC".into(),
+            "small" => "f.size ASC, f.id ASC".into(),
+            "views" => "COALESCE(f.view_count, 0) DESC, f.id DESC".into(),
+            "random" => {
+                let seed: i64 = qs
+                    .get("seed")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(1)
+                    .saturating_abs()
+                    .max(1);
+                format!("((f.id * 1103515245 + {seed}) % 2147483647), f.id")
+            }
+            _ => "f.imported_at DESC, f.id DESC".into(),
+        };
         sql.push_str(&format!(
-            " ORDER BY f.imported_at DESC, f.id DESC LIMIT {limit} OFFSET {}",
+            " ORDER BY {order} LIMIT {limit} OFFSET {}",
             offset.max(0)
         ));
 
@@ -661,16 +688,145 @@ fn ingest_file(data_b64: &str, ext: &str) -> Result<bool, String> {
     res
 }
 
-fn process_url(app: AppHandle, url: String) {
-    let _ = app.emit("web-import", json!({"stage": "start", "line": format!("Скачиваю: {url}")}));
-    let result = download_and_import(&app, &url);
+// ---------- Очередь скачиваний ----------
+// Расширение может «выстрелить» десятком ссылок подряд (например, страницы
+// комикса), а gallery-dl и сайдкар работают по одной задаче. Раньше на каждую
+// ссылку поднимался поток, и все они молча ждали на мьютексе сайдкара.
+// Теперь ссылки копятся в очереди, обрабатываются по порядку, а UI видит,
+// сколько осталось.
+struct DlTask {
+    url: String,
+    comic: bool,
+}
+static DL_TX: std::sync::OnceLock<std::sync::mpsc::Sender<DlTask>> = std::sync::OnceLock::new();
+static DL_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn dl_pending() -> usize {
+    DL_PENDING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn enqueue_download(app: AppHandle, url: String, comic: bool) {
+    let tx = DL_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<DlTask>();
+        let worker_app = app.clone();
+        std::thread::spawn(move || {
+            for task in rx {
+                process_url(worker_app.clone(), task.url, task.comic);
+                DL_PENDING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let left = dl_pending();
+                if left > 0 {
+                    let _ = worker_app.emit(
+                        "web-import",
+                        json!({"stage": "queue", "line": format!("В очереди ещё: {left}")}),
+                    );
+                }
+            }
+        });
+        tx
+    });
+    DL_PENDING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if tx.send(DlTask { url, comic }).is_err() {
+        DL_PENDING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    let n = dl_pending();
+    if n > 1 {
+        let _ = app.emit(
+            "web-import",
+            json!({"stage": "queue", "line": format!("Добавлено в очередь (всего: {n})")}),
+        );
+    }
+}
+
+/// Похоже на прямую ссылку на медиафайл (…/картинка.webp)?
+fn looks_like_media_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
+    [
+        ".jpg", ".jpeg", ".jfif", ".png", ".webp", ".gif", ".bmp", ".avif", ".heic",
+        ".mp4", ".webm", ".mov", ".m4v", ".mkv",
+    ]
+    .iter()
+    .any(|e| path.ends_with(e))
+}
+
+/// Прямое скачивание файла по ссылке — запасной путь, когда gallery-dl не знает
+/// сайт или тот отвечает отказом на «не браузерный» запрос. Представляемся
+/// браузером и передаём Referer: многие сайты без этого отдают 403.
+fn fetch_direct(url: &str) -> Result<PathBuf, String> {
+    let clean = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = normalize_ext(clean.rsplit('.').next().unwrap_or("jpg"));
+    // Referer = корень сайта, откуда ссылка
+    let origin = url
+        .split_once("://")
+        .and_then(|(sch, rest)| rest.split('/').next().map(|h| format!("{sch}://{h}/")))
+        .unwrap_or_else(|| url.to_string());
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(url)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        )
+        .header(reqwest::header::REFERER, origin)
+        .send()
+        .map_err(|e| format!("не удалось соединиться с сайтом: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("сайт ответил: {}", resp.status()));
+    }
+    let bytes = resp.bytes().map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        return Err("сайт вернул пустой файл".into());
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("fm_direct_{ts}.{ext}"));
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    Ok(tmp)
+}
+
+/// Ссылка на пул/комикс? Тогда качаем его целиком.
+/// e621: `/pools/123` или пост с `?pool_id=123` — приводим к ссылке на пул.
+fn comic_url(url: &str) -> Option<String> {
+    let u = url.trim();
+    if let Some(rest) = u.split("pool_id=").nth(1) {
+        let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !id.is_empty() {
+            let host = if u.contains("e926.net") { "e926.net" } else { "e621.net" };
+            return Some(format!("https://{host}/pools/{id}"));
+        }
+    }
+    if u.contains("/pools/") {
+        return Some(u.to_string());
+    }
+    None
+}
+
+fn process_url(app: AppHandle, url: String, comic: bool) {
+    let what = if comic { "комикс" } else { "арт" };
+    let _ = app.emit(
+        "web-import",
+        json!({"stage": "start", "line": format!("Скачиваю {what}: {url}")}),
+    );
+    let result = download_and_import(&app, &url, comic);
     match result {
-        Ok((imported, dupes)) => {
-            let _ = app.emit(
-                "web-import",
-                json!({"stage": "done",
-                       "line": format!("Готово: добавлено {imported}, дубликатов {dupes}")}),
-            );
+        Ok((imported, dupes, grouped)) => {
+            let mut line = format!("Готово: добавлено {imported}, дубликатов {dupes}");
+            if let Some(g) = grouped {
+                line.push_str(&format!(" · собрано в комикс: {g} стр."));
+            }
+            let left = dl_pending().saturating_sub(1);
+            if left > 0 {
+                line.push_str(&format!(" · в очереди ещё {left}"));
+            }
+            let _ = app.emit("web-import", json!({"stage": "done", "line": line}));
         }
         Err(e) => {
             let _ = app.emit("web-import", json!({"stage": "error", "line": e}));
@@ -678,31 +834,84 @@ fn process_url(app: AppHandle, url: String) {
     }
 }
 
-fn download_and_import(app: &AppHandle, url: &str) -> Result<(i64, i64), String> {
+/// Возвращает (добавлено, дубликатов, страниц в собранном комиксе).
+fn download_and_import(
+    app: &AppHandle,
+    url: &str,
+    comic: bool,
+) -> Result<(i64, i64, Option<usize>), String> {
     let cfg = load_config();
     let root = PathBuf::from(cfg.library_root.ok_or("Библиотека не настроена")?);
     let (script, python) = sidecar_cfg_pub()?;
 
     // Сайдкар качает через gallery-dl и возвращает файлы + метаданные
     let ai = app.state::<AiState>();
-    let res = ai.sidecar.rpc(
+    let res = ai.sidecar.rpc_cb(
         &script,
         &python,
         "download",
-        json!({ "url": url, "cookies": cfg.browser_cookies.clone().unwrap_or_default() }),
-    )?;
+        json!({
+            "url": url,
+            "comic": comic,
+            "cookies": cfg.browser_cookies.clone().unwrap_or_default()
+        }),
+        &|p| {
+            // Отчёт сайдкара о ходе скачивания: сколько файлов уже легло
+            let n = p.get("files").and_then(|v| v.as_i64()).unwrap_or(0);
+            let line = if comic {
+                format!("Скачиваю комикс: страниц готово {n}…")
+            } else {
+                format!("Скачиваю: файлов готово {n}…")
+            };
+            let _ = app.emit("web-import", json!({"stage": "start", "line": line}));
+        },
+    );
 
-    let items = res
-        .get("items")
-        .and_then(|v| v.as_array())
-        .ok_or("gallery-dl ничего не скачал")?;
-    let tmp_dir = res.get("dir").and_then(|v| v.as_str()).map(String::from);
+    // gallery-dl знает не все сайты. Если он ничего не принёс, а ссылка ведёт
+    // прямо на файл — качаем сами (с заголовками браузера).
+    let (items, tmp_dir, direct_tmp): (Vec<serde_json::Value>, Option<String>, Option<PathBuf>) =
+        match &res {
+            Ok(v) => {
+                let list = v
+                    .get("items")
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let dir = v.get("dir").and_then(|x| x.as_str()).map(String::from);
+                (list, dir, None)
+            }
+            Err(e) => {
+                eprintln!("[server] gallery-dl: {e}");
+                (Vec::new(), None, None)
+            }
+        };
+    let (items, direct_tmp) = if items.is_empty() {
+        if !looks_like_media_url(url) {
+            // Не прямая ссылка и gallery-dl не справился — отдаём его ошибку
+            return Err(match res {
+                Err(e) => e,
+                Ok(_) => "gallery-dl ничего не скачал по этой ссылке".to_string(),
+            });
+        }
+        let _ = app.emit(
+            "web-import",
+            json!({"stage": "start", "line": "Качаю файл напрямую…"}),
+        );
+        let p = fetch_direct(url)?;
+        let one = json!({ "path": p.to_string_lossy(), "url": url });
+        (vec![one], Some(p))
+    } else {
+        (items, direct_tmp)
+    };
 
     let conn = db::open(&root.join("library.db")).map_err(|e| e.to_string())?;
     let lossless = cfg.lossless.unwrap_or(false);
     let (mut imported, mut dupes) = (0i64, 0i64);
+    // Для комикса: id страниц по порядку скачивания и имя пула
+    let mut page_ids: Vec<i64> = Vec::new();
+    let mut pool_name = String::new();
 
-    for it in items {
+    for it in &items {
         let Some(path) = it.get("path").and_then(|p| p.as_str()) else { continue };
         let (file_id, is_new) = match import::import_one(&conn, &root, std::path::Path::new(path), false, lossless, false) {
             Ok(r) => r,
@@ -712,6 +921,20 @@ fn download_and_import(app: &AppHandle, url: &str) -> Result<(i64, i64), String>
             }
         };
         if is_new { imported += 1 } else { dupes += 1 }
+        // Точные копии дедуплицируются импортом: тот же файл получает тот же id,
+        // поэтому в комикс попадает одна страница, а не два одинаковых арта.
+        if comic {
+            if !page_ids.contains(&file_id) {
+                page_ids.push(file_id);
+            }
+            if pool_name.is_empty() {
+                if let Some(p) = it.get("pool").and_then(|v| v.as_str()) {
+                    if !p.trim().is_empty() {
+                        pool_name = p.trim().to_string();
+                    }
+                }
+            }
+        }
 
         // Источник (даже для дубликата — знание, где ещё лежит арт, полезно)
         let (src_url, site, artist, title) = (
@@ -754,9 +977,47 @@ fn download_and_import(app: &AppHandle, url: &str) -> Result<(i64, i64), String>
         }
     }
 
-    // Чистим временную папку gallery-dl
+    // Чистим временную папку gallery-dl и файл прямой закачки
     if let Some(d) = tmp_dir {
         let _ = std::fs::remove_dir_all(d);
     }
-    Ok((imported, dupes))
+    if let Some(f) = direct_tmp {
+        let _ = std::fs::remove_file(f);
+    }
+
+    // Комикс: собираем скачанные страницы в одну группу по порядку.
+    let mut grouped = None;
+    if comic && page_ids.len() >= 2 {
+        // Страницы могли раньше лежать в другой группе — переносим в новую.
+        for fid in &page_ids {
+            let _ = conn.execute(
+                "UPDATE files SET group_id = NULL, group_pos = NULL WHERE id = ?1",
+                params![fid],
+            );
+        }
+        let name = if pool_name.is_empty() { "Комикс".to_string() } else { pool_name };
+        if conn
+            .execute(
+                "INSERT INTO groups (name, kind, created_at) VALUES (?1, 'comic', ?2)",
+                params![name, crate::commands::unix_now_pub()],
+            )
+            .is_ok()
+        {
+            let gid = conn.last_insert_rowid();
+            for (i, fid) in page_ids.iter().enumerate() {
+                let _ = conn.execute(
+                    "UPDATE files SET group_id = ?1, group_pos = ?2 WHERE id = ?3",
+                    params![gid, i as i64, fid],
+                );
+            }
+            // Осиротевшие группы (страницы переехали) подчищаем
+            let _ = conn.execute(
+                "DELETE FROM groups WHERE id NOT IN \
+                 (SELECT DISTINCT group_id FROM files WHERE group_id IS NOT NULL)",
+                [],
+            );
+            grouped = Some(page_ids.len());
+        }
+    }
+    Ok((imported, dupes, grouped))
 }

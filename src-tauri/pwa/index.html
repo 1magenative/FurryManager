@@ -116,6 +116,14 @@
   <input id="q" type="search" placeholder="Поиск…" autocomplete="off"/>
   <select id="col"><option value="">📚 Все</option><option value="-1">📥 Без коллекции</option></select>
   <select id="nsfw"><option value="">Все</option><option value="0">🌱 SFW</option><option value="1">🔞 NSFW</option></select>
+  <select id="sort" title="Порядок артов">
+    <option value="">↓ Новые</option>
+    <option value="old">↑ Старые</option>
+    <option value="big">Крупные</option>
+    <option value="small">Мелкие</option>
+    <option value="views">Часто смотрю</option>
+    <option value="random">🎲 Случайно</option>
+  </select>
   <button id="refresh" class="ghost" title="Обновить (подтянуть изменения с ПК)">↻</button>
   <button id="offline" class="ghost" title="Офлайн-копия: скачать текущую коллекцию на телефон">⤓</button>
   <button id="add-link" class="ghost" title="Добавить по ссылке">🔗</button>
@@ -291,7 +299,7 @@ async function downloadOffline() {
   const label = $("col").selectedOptions[0] ? $("col").selectedOptions[0].textContent : "Все";
   let items = [];
   try {
-    let url = `/api/files?offset=0&limit=500`;
+    let url = `/api/files?offset=0&limit=500` + sortQuery();
     const q = $("q").value.trim();
     if (q) url += "&search=" + encodeURIComponent(q);
     if ($("col").value) url += "&collection=" + $("col").value;
@@ -359,7 +367,7 @@ async function loadMore(reset = false) {
   st.loading = true;
   $("status").textContent = "Загружаю…";
   try {
-    let url = `/api/files?offset=${st.offset}&limit=${st.limit}`;
+    let url = `/api/files?offset=${st.offset}&limit=${st.limit}` + sortQuery();
     const q = $("q").value.trim();
     if (q) url += "&search=" + encodeURIComponent(q);
     if ($("col").value) url += "&collection=" + $("col").value;
@@ -917,6 +925,19 @@ $("q").addEventListener("input", () => {
 });
 $("col").addEventListener("change", () => loadMore(true));
 $("nsfw").addEventListener("change", () => loadMore(true));
+// Порядок артов: зерно для «случайно» держим постоянным, иначе при подгрузке
+// страниц выдача перемешивается и арты дублируются.
+let randSeed = 1 + Math.floor(Math.random() * 2000000000);
+function sortQuery() {
+  const s = $("sort").value;
+  if (!s) return "";
+  return "&sort=" + s + (s === "random" ? "&seed=" + randSeed : "");
+}
+$("sort").addEventListener("change", () => {
+  if ($("sort").value === "random") randSeed = 1 + Math.floor(Math.random() * 2000000000);
+  try { localStorage.setItem("fm_sort", $("sort").value); } catch {}
+  loadMore(true);
+});
 // Обновление: подтянуть изменения с ПК (удалённые/новые арты, коллекции)
 $("refresh").addEventListener("click", async () => {
   $("refresh").style.transform = "rotate(360deg)";
@@ -1014,6 +1035,10 @@ $("add-link").addEventListener("click", async () => {
 async function boot() {
   attachManifest();
   registerSW();
+  try {
+    const s = localStorage.getItem("fm_sort");
+    if (s) $("sort").value = s;
+  } catch {}
   await refreshOfflineIndex().catch(() => {});
   try {
     // Стартовый фильтр — тот же, что настроен на ПК («Фильтр при запуске»)

@@ -46,9 +46,9 @@
 [Releases](../../releases):
 
 ```bash
-sudo apt install ./FurryManager_0.6.0_amd64.deb
+sudo apt install ./FurryManager_0.8.0_amd64.deb
 # либо
-chmod +x FurryManager_0.6.0_amd64.AppImage && ./FurryManager_0.6.0_amd64.AppImage
+chmod +x FurryManager_0.8.0_amd64.AppImage && ./FurryManager_0.8.0_amd64.AppImage
 ```
 
 Для видео (превью, индексация, конвертация в GIF) в Linux нужны кодеки —

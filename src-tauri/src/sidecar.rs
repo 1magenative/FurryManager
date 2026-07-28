@@ -96,6 +96,20 @@ impl Sidecar {
     /// Mutex сериализует запросы; при ошибке ввода-вывода процесс перезапускается
     /// при следующем вызове.
     pub fn rpc(&self, script: &Path, python: &str, method: &str, params: Value) -> Result<Value, String> {
+        self.rpc_cb(script, python, method, params, &|_| {})
+    }
+
+    /// То же, но с обратным вызовом на промежуточные отчёты о ходе работы
+    /// (сайдкар шлёт {"id": …, "progress": {…}} — например, сколько страниц
+    /// комикса уже скачано; длинные задачи иначе выглядят зависшими).
+    pub fn rpc_cb(
+        &self,
+        script: &Path,
+        python: &str,
+        method: &str,
+        params: Value,
+        on_progress: &dyn Fn(&Value),
+    ) -> Result<Value, String> {
         let mut guard = self.inner.lock().unwrap();
         if guard.is_none() {
             *guard = Some(Self::spawn(script, python)?);
@@ -105,7 +119,7 @@ impl Sidecar {
         proc.next_id += 1;
         let req = json!({"id": id, "method": method, "params": params}).to_string() + "\n";
 
-        match Self::rpc_inner(proc, id, &req) {
+        match Self::rpc_inner(proc, id, &req, on_progress) {
             Ok(v) => Ok(v),
             Err((msg, fatal)) => {
                 if fatal {
@@ -118,7 +132,12 @@ impl Sidecar {
         }
     }
 
-    fn rpc_inner(proc: &mut Proc, id: u64, req: &str) -> Result<Value, (String, bool)> {
+    fn rpc_inner(
+        proc: &mut Proc,
+        id: u64,
+        req: &str,
+        on_progress: &dyn Fn(&Value),
+    ) -> Result<Value, (String, bool)> {
         proc.stdin
             .write_all(req.as_bytes())
             .and_then(|_| proc.stdin.flush())
@@ -138,6 +157,11 @@ impl Sidecar {
                         continue; // не наш вывод — пропускаем
                     };
                     if v.get("id").and_then(|x| x.as_u64()) != Some(id) {
+                        continue;
+                    }
+                    // Промежуточный отчёт — отдаём наверх и ждём результат дальше
+                    if let Some(p) = v.get("progress") {
+                        on_progress(p);
                         continue;
                     }
                     if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
